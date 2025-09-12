@@ -55,34 +55,8 @@ void taskMAnager_init(SystemStatus *systemStatus) {
         return;
     }
 
-    // /**
-    //  * @brief Tasks para o Core PRO_CPU_NUM
-    //  */
-    // xTaskCreatePinnedToCore(wifi_task, TASK_NAME_WIFI, SIZE_TASK_STACK(5), systemStatus, WIFI_TASK_PRIORITY, NULL, PRO_CPU_NUM);
-    // xTaskCreatePinnedToCore(webServer_task, TASK_NAME_WEB_SERVER, SIZE_TASK_STACK(10), systemStatus, WEBSERVER_TASK_PRIORITY, NULL, PRO_CPU_NUM);
-    // xTaskCreatePinnedToCore(sensors_Task, TASK_NAME_SENSORS, SIZE_TASK_STACK(3), systemStatus, SENSORS_TASK_PRIORITY, NULL, PRO_CPU_NUM);
-    // /**
-    //  * @brief Tasks para o Core APP_CPU_NUM
-    //  */
-    // xTaskCreatePinnedToCore(servers_task, TASK_NAME_SERVERS, SIZE_TASK_STACK(5), systemStatus, SERVERS_TASK_PRIORITY, NULL, APP_CPU_NUM);
-    // xTaskCreatePinnedToCore(displayTask_run, TASK_NAME_DISPLAY, SIZE_TASK_STACK(18), systemStatus, DISPLAY_TASK_PRIORITY, NULL, APP_CPU_NUM);
-    // xTaskCreatePinnedToCore(buzzerTask_run, TASK_NAME_BUZZER, SIZE_TASK_STACK(4), systemStatus, BUZZER_TASK_PRIORITY, NULL, APP_CPU_NUM);
-    // xTaskCreatePinnedToCore(ledTask_run, TASK_NAME_LED, SIZE_TASK_STACK(3), systemStatus, LED_TASK_PRIORITY, NULL, APP_CPU_NUM);
-    // xTaskCreatePinnedToCore(canTask_run, TASK_NAME_CAN, SIZE_TASK_STACK(6), systemStatus, CAN_TASK_PRIORITY, NULL, APP_CPU_NUM);
-    // xTaskCreatePinnedToCore(gyroscopeTask_run, TASK_NAME_GYROSCOPE, SIZE_TASK_STACK(4), systemStatus, GYROSCOPE_TASK_PRIORITY, NULL, APP_CPU_NUM);
-
-    // xTaskCreate(displayTask_run, TASK_NAME_DISPLAY, SIZE_TASK_STACK(10), systemStatus, DISPLAY_TASK_PRIORITY, NULL); // atualizada
-    // // Todas as tasks criadas com os tamanhos de stack já definidos
-    // fileSystem_init(systemStatus);
-    // xTaskCreate(wifi_task, TASK_NAME_WIFI, SIZE_TASK_STACK(4), systemStatus, WIFI_TASK_PRIORITY, NULL); // atualizada
-    // xTaskCreate(webServer_task, TASK_NAME_WEB_SERVER, SIZE_TASK_STACK(6), systemStatus, WEBSERVER_TASK_PRIORITY, NULL); // atualizada
-    // xTaskCreate(sensors_Task, TASK_NAME_SENSORS, SIZE_TASK_STACK(2), systemStatus, SENSORS_TASK_PRIORITY, NULL); // atualizada
-    // xTaskCreate(servers_task, TASK_NAME_SERVERS, SIZE_TASK_STACK(4), systemStatus, SERVERS_TASK_PRIORITY, NULL); // Sem Youtube
-    // xTaskCreate(buzzerTask_run, TASK_NAME_BUZZER, SIZE_TASK_STACK(4), systemStatus, BUZZER_TASK_PRIORITY, NULL);
-    // xTaskCreate(ledTask_run, TASK_NAME_LED, SIZE_TASK_STACK(3), systemStatus, LED_TASK_PRIORITY, NULL);
     xTaskCreate(canTask_run, TASK_NAME_CAN, SIZE_TASK_STACK(6), systemStatus, CAN_TASK_PRIORITY, NULL);
-    // xTaskCreate(gyroscopeTask_run, TASK_NAME_GYROSCOPE, SIZE_TASK_STACK(3), systemStatus, GYROSCOPE_TASK_PRIORITY, NULL);
-    // xTaskCreate(lembretes_task, TASK_NAME_LEMBRETES, SIZE_TASK_STACK(2), systemStatus, LEMBRETES_TASK_PRIORITY, NULL);
+
     systemStatus->machine.allTasksInitialized = true;
 }
 
