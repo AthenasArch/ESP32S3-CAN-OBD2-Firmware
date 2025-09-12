@@ -610,10 +610,6 @@
 
 
 
-
-
-
-
 #include <Arduino.h>
 #include <esp32_obd2.h>
 #include <esp32_can.h>
