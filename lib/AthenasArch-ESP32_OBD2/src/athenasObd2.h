@@ -110,8 +110,7 @@ enum
 
 // default timeout for a response in milliseconds
 #define OBD2_DEFAULT_TIMEOUT 2000
-#define OBD2_RECONNECT_INTERVAL_MS 2000  // tempo mínimo entre tentativas de reconexão
-
+#define OBD2_RECONNECT_INTERVAL_MS 30000  // valor inicial (pode ser sobrescrito via setReconnectInterval)
 
 // Modo de endereçamento OBD-II
 enum Obd2AddrMode {
@@ -159,6 +158,11 @@ public:
 
     int clearAllStoredDTC();
 
+    // --- Reconexão --- 
+    void setReconnectInterval(uint32_t ms);   // define intervalo entre tentativas
+    bool forceReconnect();                    // tenta reconectar imediatamente
+    uint32_t timeToNextReconnect() const;     // ms restantes até próxima tentativa
+
 private:
     // --- Funções internas ---
     int supportedPidsRead();
@@ -178,7 +182,10 @@ private:
     bool heartbeatOnce();
     void closeBus();
 
+
 private:
+    SemaphoreHandle_t _canMutex;
+
     // --- Variáveis de estado ---
     unsigned long _responseTimeout;
     bool _useExtendedAddressing;
@@ -190,6 +197,9 @@ private:
     bool _connected;         // estado de conexão
 
     // FSM de auto-reconexão
+    uint32_t _userReconnectIntervalMs = OBD2_RECONNECT_INTERVAL_MS;
+    uint32_t _lastReconnectAttempt = 0;
+
     uint8_t _hbPid;
     uint32_t _hbIntervalMs;
     uint32_t _lastHbMs;

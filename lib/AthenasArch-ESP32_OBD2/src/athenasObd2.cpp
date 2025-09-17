@@ -324,6 +324,7 @@ OBD2Class::OBD2Class() : _responseTimeout(OBD2_DEFAULT_TIMEOUT),
                          _lastPidResponseMillis(0)
 {
     memset(_supportedPids, 0x00, sizeof(_supportedPids));
+    _canMutex = xSemaphoreCreateMutex();
     _addrMode = OBD2_ADDR_11BIT;
     _baud = 0;
     _connected = false;   // NOVO
@@ -434,45 +435,30 @@ void OBD2Class::setBackoff(uint32_t initialMs, uint32_t maxMs)
     _backoffMaxMs = maxMs ? maxMs : 8000;
 }
 
-void OBD2Class::tick()
-{
+void OBD2Class::tick() {
     uint32_t now = millis();
 
-    if (_connected)
-    {
-        // Heartbeat temporizado
-        if (now - _lastHbMs >= _hbIntervalMs)
-        {
+    if (_connected) {
+        // heartbeat normal
+        if (now - _lastHbMs >= _hbIntervalMs) {
             _lastHbMs = now;
-            if (!heartbeatOnce())
-            {
-                // perdeu conexão -> fecha e inicia redetecção com backoff resetado
+            if (!heartbeatOnce()) {
                 closeBus();
-                _lastDetectMs = now;
-                _backoffMs = (_backoffMs < 1000) ? 1000 : _backoffMs; // sanity
+                _lastReconnectAttempt = now; // marca falha
             }
         }
-        return; // se está conectado, não tenta detectar aqui
-    }
-
-    // Desconectado: respeita cooldown/backoff
-    if (now - _lastDetectMs < _backoffMs)
         return;
+    }
 
-    if (detectOnce())
-    {
-        // sucesso -> reseta backoff
-        _backoffMs = 1000;
+    // só tenta reconectar quando atingir o tempo definido
+    if (now - _lastReconnectAttempt >= _userReconnectIntervalMs) {
+        if (detectOnce()) {
+            _backoffMs = 1000; // opcional: reset
+        }
+        _lastReconnectAttempt = now;
     }
-    else
-    {
-        // falha -> aumenta exponencial (até max)
-        _backoffMs = (_backoffMs << 1);
-        if (_backoffMs > _backoffMaxMs)
-            _backoffMs = _backoffMaxMs;
-    }
-    _lastDetectMs = now;
 }
+
 
 /// @brief
 /// @return
@@ -539,6 +525,25 @@ bool OBD2Class::pidSupported(uint8_t pid)
 bool OBD2Class::connected() const { return _connected; }
 uint32_t OBD2Class::currentBaud() const { return _baud; }
 bool OBD2Class::isExtended() const { return (_addrMode == OBD2_ADDR_29BIT); }
+
+void OBD2Class::setReconnectInterval(uint32_t ms) {
+    _userReconnectIntervalMs = ms;
+}
+
+bool OBD2Class::forceReconnect() {
+    closeBus();
+    bool ok = detectOnce();
+    _lastReconnectAttempt = millis(); // reseta o timer
+    return ok;
+}
+
+uint32_t OBD2Class::timeToNextReconnect() const {
+    if (_connected) return 0;
+    uint32_t elapsed = millis() - _lastReconnectAttempt;
+    if (elapsed >= _userReconnectIntervalMs) return 0;
+    return _userReconnectIntervalMs - elapsed;
+}
+
 
 bool OBD2Class::pidValueRaw(uint8_t pid)
 {
@@ -1008,54 +1013,71 @@ bool OBD2Class::recv_pid_29(uint8_t expected_service_resp, uint8_t pid, uint8_t 
     return false;
 }
 
+// -----------------------------
+// pidRead29 atualizado com mutex
+// -----------------------------
 bool OBD2Class::pidRead29(uint8_t pid, float &outVal)
 {
     const uint8_t SERVICE = 0x01;
     const uint8_t SERVICE_RESP = 0x41;
 
-    if (!send_pid_29(SERVICE, pid))
-        return false;
+    bool ok = false;
 
-    uint8_t buf[8] = {0};
-    if (!recv_pid_29(SERVICE_RESP, pid, buf, 200))
-        return false;
-
-    uint8_t AA = buf[3];
-    uint8_t BB = buf[4];
-
-    switch (pid)
+    if (xSemaphoreTake(_canMutex, pdMS_TO_TICKS(200)))  // protege acesso ao TWAI
     {
-    case ENGINE_RPM:
-        outVal = (256.0f * AA + BB) / 4.0f;
-        return true;
-    case VEHICLE_SPEED:
-        outVal = AA;
-        return true;
-    case ENGINE_COOLANT_TEMPERATURE:
-    case AIR_INTAKE_TEMPERATURE:
-        outVal = (int)AA - 40;
-        return true;
-    case INTAKE_MANIFOLD_ABSOLUTE_PRESSURE:
-        outVal = AA;
-        return true;
-    case THROTTLE_POSITION:
-    case CALCULATED_ENGINE_LOAD:
-        outVal = (AA * 100.0f) / 255.0f;
-        return true;
-    case MAF_AIR_FLOW_RATE:
-        outVal = (256.0f * AA + BB) / 100.0f;
-        return true;
-    case TIMING_ADVANCE:
-        outVal = (AA / 2.0f) - 64.0f;
-        return true;
-    case FUEL_TANK_LEVEL_INPUT:
-        outVal = (AA * 100.0f) / 255.0f;
-        return true;
-    case PIDS_SUPPORT_01_20:
-        outVal = 1.0f;
-        return true;
-    }
-    return false;
-}
+        if (send_pid_29(SERVICE, pid)) {
+            uint8_t buf[8] = {0};
+            if (recv_pid_29(SERVICE_RESP, pid, buf, 200)) {
 
+                uint8_t AA = buf[3];
+                uint8_t BB = buf[4];
+
+                switch (pid)
+                {
+                case ENGINE_RPM:
+                    outVal = (256.0f * AA + BB) / 4.0f;
+                    ok = true;
+                    break;
+                case VEHICLE_SPEED:
+                    outVal = AA;
+                    ok = true;
+                    break;
+                case ENGINE_COOLANT_TEMPERATURE:
+                case AIR_INTAKE_TEMPERATURE:
+                    outVal = (int)AA - 40;
+                    ok = true;
+                    break;
+                case INTAKE_MANIFOLD_ABSOLUTE_PRESSURE:
+                    outVal = AA;
+                    ok = true;
+                    break;
+                case THROTTLE_POSITION:
+                case CALCULATED_ENGINE_LOAD:
+                    outVal = (AA * 100.0f) / 255.0f;
+                    ok = true;
+                    break;
+                case MAF_AIR_FLOW_RATE:
+                    outVal = (256.0f * AA + BB) / 100.0f;
+                    ok = true;
+                    break;
+                case TIMING_ADVANCE:
+                    outVal = (AA / 2.0f) - 64.0f;
+                    ok = true;
+                    break;
+                case FUEL_TANK_LEVEL_INPUT:
+                    outVal = (AA * 100.0f) / 255.0f;
+                    ok = true;
+                    break;
+                case PIDS_SUPPORT_01_20:
+                    outVal = 1.0f;
+                    ok = true;
+                    break;
+                }
+            }
+        }
+        xSemaphoreGive(_canMutex);
+    }
+
+    return ok;
+}
 OBD2Class OBD2;

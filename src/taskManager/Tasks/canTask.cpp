@@ -635,18 +635,22 @@
   #define CAN_TASK_DEBUG_PRINTLN(...)
   #define CAN_TASK_DEBUG_PRINTF(...)
 #endif
-
 // =====================
 // Controle de tempo de coleta/log
 // =====================
-static uint32_t lastFast = 0;
-static uint32_t lastMed = 0;
-static uint32_t lastSlow = 0;
-static uint32_t lastLog = 0;
+// Variáveis que armazenam o "último tempo" (em ms) em que cada grupo de coleta foi executado.
+// Isso permite espaçar a frequência de leitura de PIDs e evitar leituras redundantes.
+static uint32_t lastFast = 0;   // Leituras rápidas (ex.: RPM, velocidade) ~30 ms
+static uint32_t lastMed  = 0;   // Leituras médias (ex.: temp. motor, pressão coletor) ~600 ms
+static uint32_t lastSlow = 0;   // Leituras lentas (ex.: carga, MAF) ~1000 ms
+static uint32_t lastLog  = 0;   // Debug/log de status ~1000 ms
 
 // =====================
 // Auxiliares
 // =====================
+
+// Reseta os valores de todos os PIDs monitorados para 0
+// Chamado quando a conexão CAN é perdida ou ainda não estabelecida.
 static void resetValuePIDs(SystemStatus *s)
 {
     s->automotiveSystem.canMonitor.engineRPM = 0;
@@ -661,6 +665,8 @@ static void resetValuePIDs(SystemStatus *s)
     s->automotiveSystem.canMonitor.massAirFlowRate = 0;
 }
 
+// Wrapper seguro para leitura de PIDs.
+// Retorna false se a leitura falhar (timeout, erro de barramento, etc.)
 static inline bool readPidSafe(uint8_t pid, float &out)
 {
     return OBD2.readPid(pid, out);
@@ -669,6 +675,9 @@ static inline bool readPidSafe(uint8_t pid, float &out)
 // =====================
 // Coletas
 // =====================
+
+// Coleta de PIDs mais críticos, que mudam rápido (ex.: RPM, velocidade).
+// Executado a cada ~30 ms.
 static void collectFast(SystemStatus *st)
 {
     float v;
@@ -678,6 +687,8 @@ static void collectFast(SystemStatus *st)
         st->automotiveSystem.canMonitor.vehicleSpeed = (int)v;
 }
 
+// Coleta de PIDs de média prioridade, que não mudam tão rápido.
+// Executado a cada ~600 ms.
 static void collectMedium(SystemStatus *st)
 {
     float v;
@@ -691,6 +702,8 @@ static void collectMedium(SystemStatus *st)
         st->automotiveSystem.canMonitor.intakeManifoldPressure = (int)v;
 }
 
+// Coleta de PIDs menos críticos, que mudam devagar (ex.: carga calculada, MAF).
+// Executado a cada ~1000 ms.
 static void collectSlow(SystemStatus *st)
 {
     float v;
@@ -704,6 +717,8 @@ static void collectSlow(SystemStatus *st)
         st->automotiveSystem.canMonitor.massAirFlowRate = v;
 }
 
+// Debug detalhado dos valores coletados e status da conexão.
+// Executado periodicamente para monitoramento humano.
 static void debugDump(SystemStatus *st)
 {
     CAN_TASK_DEBUG_PRINTLN("====== OBD MONITOR ======");
@@ -726,7 +741,7 @@ static void debugDump(SystemStatus *st)
 }
 
 // =====================
-// Task principal
+// Task principal (executa como FreeRTOS task)
 // =====================
 void canTask_run(void *pvParameters)
 {
@@ -736,71 +751,82 @@ void canTask_run(void *pvParameters)
     CAN_TASK_DEBUG_PRINTLN("    CAN OBD2 MONITOR TASK");
     CAN_TASK_DEBUG_PRINTLN("------------------------");
 
-    vTaskDelay(pdMS_TO_TICKS(TIME_TO_INIT_TASK_CAN) );
+    vTaskDelay(pdMS_TO_TICKS(TIME_TO_INIT_TASK_CAN)); // Pequeno atraso inicial antes de iniciar a task
 
-    // Pinos do TWAI
+    // Configura os pinos físicos do controlador CAN (TWAI no ESP32).
     CAN0.setCANPins((gpio_num_t)PIN_PCI_ATHENAS_CAN_RX,
                     (gpio_num_t)PIN_PCI_ATHENAS_CAN_TX);
 
-    // Ajustes da FSM da lib
-    OBD2.setTimeout(TIME_TO_REQUEST_CAN_PID);
-    OBD2.setHeartbeatPid(ENGINE_RPM);
-    OBD2.setHeartbeatInterval(1000); // 1s
-    OBD2.setBackoff(1000, 8000);     // 1s..8s
+    // Configuração da biblioteca OBD2 (FSM interna de heartbeat e reconexão).
+    OBD2.setTimeout(TIME_TO_REQUEST_CAN_PID); // Timeout de resposta de PID
+    OBD2.setHeartbeatPid(ENGINE_RPM);         // PID usado como "batimento cardíaco"
+    OBD2.setHeartbeatInterval(1000);          // Intervalo de 1s entre heartbeats
+    OBD2.setBackoff(1000, 8000);              // Backoff exponencial entre tentativas: 1s..8s
+    OBD2.setReconnectInterval(10000);         // Intervalo fixo entre tentativas automáticas (10s)
 
-    // Primeira varredura automática
+    // Primeira tentativa automática de detecção de protocolo
     OBD2.beginAuto();
 
-    // Estado inicial do app
+    // Atualiza status inicial do sistema
     systemStatus->automotiveSystem.canConnected = OBD2.connected();
     systemStatus->automotiveSystem.canBaud = OBD2.currentBaud();
     systemStatus->automotiveSystem.canExtended = OBD2.isExtended() ? 1 : 0;
-    resetValuePIDs(systemStatus);
+    resetValuePIDs(systemStatus); // Começa com os PIDs zerados
 
-    unsigned long canTimer = millis();
+    unsigned long canTimer = millis(); // Timer de referência para checagens de memória
 
     for (;;)
     {
+        // Verifica uso de memória dessa task (diagnóstico)
         task_checkUsedMem(TASK_NAME_CAN, &canTimer);
 
-        // Deixa a biblioteca cuidar de heartbeat/redetecção
+        // Deixa a biblioteca gerenciar heartbeat e reconexão automática
         OBD2.tick();
 
-        // Reflete status atual no SystemStatus
+        // Reflete o status atual da conexão no SystemStatus (visível para o resto do app)
         systemStatus->automotiveSystem.canConnected = OBD2.connected();
         systemStatus->automotiveSystem.canBaud = OBD2.currentBaud();
         systemStatus->automotiveSystem.canExtended = OBD2.isExtended() ? 1 : 0;
 
         if (systemStatus->automotiveSystem.canConnected)
         {
+            // Se está conectado, coleta PIDs conforme prioridade/tempo
             uint32_t now = millis();
 
-            if (now - lastFast >= 30)
-            {
+            if (now - lastFast >= 30) {
                 lastFast = now;
                 collectFast(systemStatus);
             }
-            if (now - lastMed >= 600)
-            {
+            if (now - lastMed >= 600) {
                 lastMed = now;
                 collectMedium(systemStatus);
             }
-            if (now - lastSlow >= 1000)
-            {
+            if (now - lastSlow >= 1000) {
                 lastSlow = now;
                 collectSlow(systemStatus);
             }
-            if (now - lastLog >= 1000)
-            {
+            if (now - lastLog >= 1000) {
                 lastLog = now;
-                debugDump(systemStatus);
+                debugDump(systemStatus); // Log para debug
             }
         }
         else
         {
+            // Se não está conectado: zera valores e informa tempo para próxima tentativa
             resetValuePIDs(systemStatus);
+
+            // Log do tempo até próxima reconexão (apenas 1x por segundo)
+            static uint32_t lastDebugReconnect = 0;
+            uint32_t now = millis();
+
+            if (now - lastDebugReconnect >= 1000) {
+                lastDebugReconnect = now;
+                uint32_t ttnr = OBD2.timeToNextReconnect();
+                CAN_TASK_DEBUG_PRINTF("Sem conexão. Próxima tentativa em %lu ms\n", (unsigned long)ttnr);
+            }
         }
 
+        // Evita travar a CPU: pequena pausa de 10 ms entre loops
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
