@@ -3,7 +3,7 @@
 
 #include <math.h>
 #include <esp32_can.h>
-#include "esp32_obd2.h"
+#include "athenasObd2.h"
 
 #define PROGMEM
 
@@ -517,8 +517,10 @@ void OBD2Class::end()
     //  CAN0.end();
 }
 
-void OBD2Class::closeBus()
-{
+void OBD2Class::closeBus() {
+    if (!_connected && _baud == 0) {
+        return; // já está fechado, não precisa mexer
+    }
     CAN0.disable();
     _connected = false;
     _baud = 0;

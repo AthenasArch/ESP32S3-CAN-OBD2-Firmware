@@ -610,8 +610,12 @@
 
 
 
+
+
+
+
 #include <Arduino.h>
-#include <esp32_obd2.h>
+#include <athenasObd2.h>
 #include <esp32_can.h>
 #include <can_common.h>
 #include "Hardware/hardware.h"
@@ -635,131 +639,168 @@
 // =====================
 // Controle de tempo de coleta/log
 // =====================
-static uint32_t lastFast  = 0;
-static uint32_t lastMed   = 0;
-static uint32_t lastSlow  = 0;
-static uint32_t lastLog   = 0;
+static uint32_t lastFast = 0;
+static uint32_t lastMed = 0;
+static uint32_t lastSlow = 0;
+static uint32_t lastLog = 0;
 
 // =====================
 // Auxiliares
 // =====================
-static void resetPIDs(SystemStatus *s) {
-  s->automotiveSystem.canMonitor.engineRPM = 0;
-  s->automotiveSystem.canMonitor.vehicleSpeed = 0;
-  s->automotiveSystem.canMonitor.fuelLevel = 0;
-  s->automotiveSystem.canMonitor.engineCoolantTemperature = 0;
-  s->automotiveSystem.canMonitor.intakeAirTemperature = 0;
-  s->automotiveSystem.canMonitor.intakeManifoldPressure = 0;
-  s->automotiveSystem.canMonitor.throttlePosition = 0;
-  s->automotiveSystem.canMonitor.ignitionTimingAdvance = 0;
-  s->automotiveSystem.canMonitor.calculatedLoadValue = 0;
-  s->automotiveSystem.canMonitor.massAirFlowRate = 0;
+static void resetValuePIDs(SystemStatus *s)
+{
+    s->automotiveSystem.canMonitor.engineRPM = 0;
+    s->automotiveSystem.canMonitor.vehicleSpeed = 0;
+    s->automotiveSystem.canMonitor.fuelLevel = 0;
+    s->automotiveSystem.canMonitor.engineCoolantTemperature = 0;
+    s->automotiveSystem.canMonitor.intakeAirTemperature = 0;
+    s->automotiveSystem.canMonitor.intakeManifoldPressure = 0;
+    s->automotiveSystem.canMonitor.throttlePosition = 0;
+    s->automotiveSystem.canMonitor.ignitionTimingAdvance = 0;
+    s->automotiveSystem.canMonitor.calculatedLoadValue = 0;
+    s->automotiveSystem.canMonitor.massAirFlowRate = 0;
 }
 
-static inline bool readPidSafe(uint8_t pid, float &out) {
-  return OBD2.readPid(pid, out);
+static inline bool readPidSafe(uint8_t pid, float &out)
+{
+    return OBD2.readPid(pid, out);
 }
 
 // =====================
 // Coletas
 // =====================
-static void collectFast(SystemStatus *st) {
-  float v;
-  if (readPidSafe(ENGINE_RPM, v))        st->automotiveSystem.canMonitor.engineRPM = (int)v;
-  if (readPidSafe(VEHICLE_SPEED, v))     st->automotiveSystem.canMonitor.vehicleSpeed = (int)v;
+static void collectFast(SystemStatus *st)
+{
+    float v;
+    if (readPidSafe(ENGINE_RPM, v))
+        st->automotiveSystem.canMonitor.engineRPM = (int)v;
+    if (readPidSafe(VEHICLE_SPEED, v))
+        st->automotiveSystem.canMonitor.vehicleSpeed = (int)v;
 }
 
-static void collectMedium(SystemStatus *st) {
-  float v;
-  if (readPidSafe(FUEL_TANK_LEVEL_INPUT, v))           st->automotiveSystem.canMonitor.fuelLevel = (int)v;
-  if (readPidSafe(ENGINE_COOLANT_TEMPERATURE, v))      st->automotiveSystem.canMonitor.engineCoolantTemperature = (int)v;
-  if (readPidSafe(AIR_INTAKE_TEMPERATURE, v))          st->automotiveSystem.canMonitor.intakeAirTemperature = (int)v;
-  if (readPidSafe(INTAKE_MANIFOLD_ABSOLUTE_PRESSURE, v)) st->automotiveSystem.canMonitor.intakeManifoldPressure = (int)v;
+static void collectMedium(SystemStatus *st)
+{
+    float v;
+    if (readPidSafe(FUEL_TANK_LEVEL_INPUT, v))
+        st->automotiveSystem.canMonitor.fuelLevel = (int)v;
+    if (readPidSafe(ENGINE_COOLANT_TEMPERATURE, v))
+        st->automotiveSystem.canMonitor.engineCoolantTemperature = (int)v;
+    if (readPidSafe(AIR_INTAKE_TEMPERATURE, v))
+        st->automotiveSystem.canMonitor.intakeAirTemperature = (int)v;
+    if (readPidSafe(INTAKE_MANIFOLD_ABSOLUTE_PRESSURE, v))
+        st->automotiveSystem.canMonitor.intakeManifoldPressure = (int)v;
 }
 
-static void collectSlow(SystemStatus *st) {
-  float v;
-  if (readPidSafe(THROTTLE_POSITION, v))       st->automotiveSystem.canMonitor.throttlePosition = (int)v;
-  if (readPidSafe(TIMING_ADVANCE, v))          st->automotiveSystem.canMonitor.ignitionTimingAdvance = (int)v;
-  if (readPidSafe(CALCULATED_ENGINE_LOAD, v))  st->automotiveSystem.canMonitor.calculatedLoadValue = v;
-  if (readPidSafe(MAF_AIR_FLOW_RATE, v))       st->automotiveSystem.canMonitor.massAirFlowRate = v;
+static void collectSlow(SystemStatus *st)
+{
+    float v;
+    if (readPidSafe(THROTTLE_POSITION, v))
+        st->automotiveSystem.canMonitor.throttlePosition = (int)v;
+    if (readPidSafe(TIMING_ADVANCE, v))
+        st->automotiveSystem.canMonitor.ignitionTimingAdvance = (int)v;
+    if (readPidSafe(CALCULATED_ENGINE_LOAD, v))
+        st->automotiveSystem.canMonitor.calculatedLoadValue = v;
+    if (readPidSafe(MAF_AIR_FLOW_RATE, v))
+        st->automotiveSystem.canMonitor.massAirFlowRate = v;
 }
 
-static void debugDump(SystemStatus *st) {
-  CAN_TASK_DEBUG_PRINTLN("====== OBD MONITOR ======");
-  CAN_TASK_DEBUG_PRINTF("Baud: %lu | Ext: %d | Conn: %d\n",
-    (unsigned long)OBD2.currentBaud(),
-    OBD2.isExtended() ? 1 : 0,
-    OBD2.connected() ? 1 : 0);
+static void debugDump(SystemStatus *st)
+{
+    CAN_TASK_DEBUG_PRINTLN("====== OBD MONITOR ======");
+    CAN_TASK_DEBUG_PRINTF("Baud: %lu | Ext: %d | Conn: %d\n",
+                          (unsigned long)OBD2.currentBaud(),
+                          OBD2.isExtended() ? 1 : 0,
+                          OBD2.connected() ? 1 : 0);
 
-  CAN_TASK_DEBUG_PRINTF("RPM: %ld\n", st->automotiveSystem.canMonitor.engineRPM);
-  CAN_TASK_DEBUG_PRINTF("Velocidade: %d km/h\n", st->automotiveSystem.canMonitor.vehicleSpeed);
-  CAN_TASK_DEBUG_PRINTF("Combustível: %d\n", st->automotiveSystem.canMonitor.fuelLevel);
-  CAN_TASK_DEBUG_PRINTF("Temp. Motor: %d °C\n", st->automotiveSystem.canMonitor.engineCoolantTemperature);
-  CAN_TASK_DEBUG_PRINTF("Temp. Ar: %d °C\n", st->automotiveSystem.canMonitor.intakeAirTemperature);
-  CAN_TASK_DEBUG_PRINTF("Pressão Coletor: %d kPa\n", st->automotiveSystem.canMonitor.intakeManifoldPressure);
-  CAN_TASK_DEBUG_PRINTF("Posição Acelerador: %d %%\n", st->automotiveSystem.canMonitor.throttlePosition);
-  CAN_TASK_DEBUG_PRINTF("Avanço Ignição: %d °\n", st->automotiveSystem.canMonitor.ignitionTimingAdvance);
-  CAN_TASK_DEBUG_PRINTF("Carga Calculada: %.2f\n", st->automotiveSystem.canMonitor.calculatedLoadValue);
-  CAN_TASK_DEBUG_PRINTF("MAF: %.2f g/s\n", st->automotiveSystem.canMonitor.massAirFlowRate);
-  CAN_TASK_DEBUG_PRINTLN("==========================");
+    CAN_TASK_DEBUG_PRINTF("RPM: %ld\n", st->automotiveSystem.canMonitor.engineRPM);
+    CAN_TASK_DEBUG_PRINTF("Velocidade: %d km/h\n", st->automotiveSystem.canMonitor.vehicleSpeed);
+    CAN_TASK_DEBUG_PRINTF("Combustível: %d\n", st->automotiveSystem.canMonitor.fuelLevel);
+    CAN_TASK_DEBUG_PRINTF("Temp. Motor: %d °C\n", st->automotiveSystem.canMonitor.engineCoolantTemperature);
+    CAN_TASK_DEBUG_PRINTF("Temp. Ar: %d °C\n", st->automotiveSystem.canMonitor.intakeAirTemperature);
+    CAN_TASK_DEBUG_PRINTF("Pressão Coletor: %d kPa\n", st->automotiveSystem.canMonitor.intakeManifoldPressure);
+    CAN_TASK_DEBUG_PRINTF("Posição Acelerador: %d %%\n", st->automotiveSystem.canMonitor.throttlePosition);
+    CAN_TASK_DEBUG_PRINTF("Avanço Ignição: %d °\n", st->automotiveSystem.canMonitor.ignitionTimingAdvance);
+    CAN_TASK_DEBUG_PRINTF("Carga Calculada: %.2f\n", st->automotiveSystem.canMonitor.calculatedLoadValue);
+    CAN_TASK_DEBUG_PRINTF("MAF: %.2f g/s\n", st->automotiveSystem.canMonitor.massAirFlowRate);
+    CAN_TASK_DEBUG_PRINTLN("==========================");
 }
 
 // =====================
 // Task principal
 // =====================
-void canTask_run(void *pvParameters) {
-  SystemStatus *systemStatus = (SystemStatus *)pvParameters;
+void canTask_run(void *pvParameters)
+{
+    SystemStatus *systemStatus = (SystemStatus *)pvParameters;
 
-  CAN_TASK_DEBUG_PRINTLN("------------------------");
-  CAN_TASK_DEBUG_PRINTLN("    CAN OBD2 MONITOR TASK");
-  CAN_TASK_DEBUG_PRINTLN("------------------------");
+    CAN_TASK_DEBUG_PRINTLN("------------------------");
+    CAN_TASK_DEBUG_PRINTLN("    CAN OBD2 MONITOR TASK");
+    CAN_TASK_DEBUG_PRINTLN("------------------------");
 
-  delay(TIME_TO_INIT_TASK_CAN);
+    vTaskDelay(pdMS_TO_TICKS(TIME_TO_INIT_TASK_CAN) );
 
-  // Pinos do TWAI
-  CAN0.setCANPins((gpio_num_t)PIN_PCI_ATHENAS_CAN_RX,
-                  (gpio_num_t)PIN_PCI_ATHENAS_CAN_TX);
+    // Pinos do TWAI
+    CAN0.setCANPins((gpio_num_t)PIN_PCI_ATHENAS_CAN_RX,
+                    (gpio_num_t)PIN_PCI_ATHENAS_CAN_TX);
 
-  // Ajustes da FSM da lib
-  OBD2.setTimeout(TIME_TO_REQUEST_CAN_PID);
-  OBD2.setHeartbeatPid(ENGINE_RPM);
-  OBD2.setHeartbeatInterval(1000); // 1s
-  OBD2.setBackoff(1000, 8000);     // 1s..8s
+    // Ajustes da FSM da lib
+    OBD2.setTimeout(TIME_TO_REQUEST_CAN_PID);
+    OBD2.setHeartbeatPid(ENGINE_RPM);
+    OBD2.setHeartbeatInterval(1000); // 1s
+    OBD2.setBackoff(1000, 8000);     // 1s..8s
 
-  // Primeira varredura automática
-  OBD2.beginAuto();
+    // Primeira varredura automática
+    OBD2.beginAuto();
 
-  // Estado inicial do app
-  systemStatus->automotiveSystem.canConnected = OBD2.connected();
-  systemStatus->automotiveSystem.canBaud     = OBD2.currentBaud();
-  systemStatus->automotiveSystem.canExtended = OBD2.isExtended() ? 1 : 0;
-  resetPIDs(systemStatus);
-
-  unsigned long canTimer = millis();
-
-  for (;;) {
-    task_checkUsedMem(TASK_NAME_CAN, &canTimer);
-
-    // Deixa a biblioteca cuidar de heartbeat/redetecção
-    OBD2.tick();
-
-    // Reflete status atual no SystemStatus
+    // Estado inicial do app
     systemStatus->automotiveSystem.canConnected = OBD2.connected();
-    systemStatus->automotiveSystem.canBaud     = OBD2.currentBaud();
+    systemStatus->automotiveSystem.canBaud = OBD2.currentBaud();
     systemStatus->automotiveSystem.canExtended = OBD2.isExtended() ? 1 : 0;
+    resetValuePIDs(systemStatus);
 
-    if (systemStatus->automotiveSystem.canConnected) {
-      uint32_t now = millis();
+    unsigned long canTimer = millis();
 
-      if (now - lastFast >= 30)   { lastFast = now;  collectFast(systemStatus);   }
-      if (now - lastMed  >= 600)  { lastMed  = now;  collectMedium(systemStatus); }
-      if (now - lastSlow >= 1000) { lastSlow = now;  collectSlow(systemStatus);   }
-      if (now - lastLog  >= 1000) { lastLog  = now;  debugDump(systemStatus);     }
-    } else {
-      resetPIDs(systemStatus);
+    for (;;)
+    {
+        task_checkUsedMem(TASK_NAME_CAN, &canTimer);
+
+        // Deixa a biblioteca cuidar de heartbeat/redetecção
+        OBD2.tick();
+
+        // Reflete status atual no SystemStatus
+        systemStatus->automotiveSystem.canConnected = OBD2.connected();
+        systemStatus->automotiveSystem.canBaud = OBD2.currentBaud();
+        systemStatus->automotiveSystem.canExtended = OBD2.isExtended() ? 1 : 0;
+
+        if (systemStatus->automotiveSystem.canConnected)
+        {
+            uint32_t now = millis();
+
+            if (now - lastFast >= 30)
+            {
+                lastFast = now;
+                collectFast(systemStatus);
+            }
+            if (now - lastMed >= 600)
+            {
+                lastMed = now;
+                collectMedium(systemStatus);
+            }
+            if (now - lastSlow >= 1000)
+            {
+                lastSlow = now;
+                collectSlow(systemStatus);
+            }
+            if (now - lastLog >= 1000)
+            {
+                lastLog = now;
+                debugDump(systemStatus);
+            }
+        }
+        else
+        {
+            resetValuePIDs(systemStatus);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
 }
