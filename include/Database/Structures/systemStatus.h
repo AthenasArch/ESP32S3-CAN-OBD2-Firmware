@@ -9,9 +9,10 @@ typedef struct SYSTEM_STATUS {
     DbUcStatus ucStatus; // status do micro controlador
     DbAlarm currAlarm; // status gerais de alarme
     DbWifiStatus wifi; // status do wifi
-    // DbDisplayStatus display; // status do display
+    DbDisplayStatus display; // status do display
     DbNvsNikoConfig nvsNikoConfig;
     DbNvsNetwork nvsNetworkMemory;
+    DbNvsAutomotiveConfig nvsAutomotiveConfig;
     // DbNvsNikoConfig nvsNikoConfig;
     DbNvsTokens nvsTokens;
     DbNvsLembretes nvsLembretes;

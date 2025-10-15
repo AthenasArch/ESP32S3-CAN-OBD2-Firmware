@@ -5,6 +5,7 @@
 #include "Database/Structures/systemInformation.h"
 #include "Database/Structures/systemConstants.h"
 #include "modules/eeprom/MAP_FLASH.h"
+#include "athenasObd2.h"
 
 /////////////////////////////////////////////////////////////////////
 ///
@@ -328,34 +329,38 @@ typedef enum DB_DISPLAY_PAGE{
     // DISPLAY_PAGE_DEBUG,
     // DISPLAY_PAGE_INSTAGRAM,
     DISPLAY_PAGE_LEMBRETES,
+    DISPLAY_PAGE_POMODORO,
+    DISPLAY_PAGE_COUNTER,
     DISPLAY_PAGE_NAMORADA,
     DISPLAY_PAGE_CLOCK,
     // DISPLAY_PAGE_INFO,
-    DISPLAY_PAGE_AUTOMOTIVE_PID,
+    DISPLAY_PAGE_AUTOMOTIVE_GAUGES,
     // DISPLAY_PAGE_ANIMATION,
     DISPLAY_PAGE_CONFIG,
     DISPLAY_PAGE_TOTAL
 } DbDisplayPage;
 
-// typedef struct DB_NIKO_STATUS{
-//     EyesMood currEyes;
-// } DbNikoStatus;
+typedef struct DB_NIKO_STATUS{
+    // EyesMood currEyes;
+} DbNikoStatus;
 
-// /*flags de status de operaçao do sistema*/
-// typedef struct DB_DISPLAY_STATUS {
-//     char msgBuff[50];
-//     DbGifMode gifMode;
-//     uint8_t currStaticGif;
-//     bool gifsDelay;
-//     DbNikoStatus niko;
-//     DbDisplayPage currPage;
-//     DbDisplayPage lastPage;
-//     bool btnEnterStatus;
-//     bool configuration;
-//     bool configurationChange;
-//     int configurationIndex;
-//     bool reminderTriggered;
-// }DbDisplayStatus;
+/*flags de status de operaçao do sistema*/
+typedef struct DB_DISPLAY_STATUS {
+    char msgBuff[50];
+    DbGifMode gifMode;
+    uint8_t currStaticGif;
+    bool gifsDelay;
+    DbNikoStatus niko;
+    DbDisplayPage currPage;
+    DbDisplayPage lastPage;
+    bool btnEnterStatus;
+    bool btnEnterLongPress;
+    bool btnShortPress;
+    bool configuration;
+    bool configurationChange;
+    int configurationIndex;
+    bool reminderTriggered;
+}DbDisplayStatus;
 
 typedef struct DB_PIXEL_ART{
     bool activityViaWebServer;
@@ -389,11 +394,42 @@ typedef struct DB_WEB_SERVER{
 } DbWebServer;
 
 
-typedef struct DB_SERVO_CONTROL{
-    uint8_t leftWhell;
-    uint8_t rightWhell;
-    uint8_t leftFront;
-    uint8_t rightFront;
+/**
+ * @brief Modo de operação de um canal de servo.
+ */
+typedef enum SERVO_CHANNEL_MODE {
+    SERVO_MODE_DISABLED = 0,   // Canal inativo
+    SERVO_MODE_GPIO,           // Controle digital (HIGH / LOW)
+    SERVO_MODE_PWM_PERCENT,    // PWM percentual (0–100%)
+    SERVO_MODE_SERVO_ANGLE     // Servo com ângulo (0–180°)
+} ServoChannelMode;
+
+/**
+ * @brief Canal individual controlado (GPIO, PWM, ou Servo).
+ *
+ * A estrutura mantém o valor desejado (currentValue) e o valor aplicado (previousValue).
+ * A flag `updated` é gerenciada internamente pelo servoControl_run().
+ */
+typedef struct DB_SERVO_CHANNEL {
+    ServoChannelMode mode;     // modo de operação (GPIO, PWM ou servo)
+    uint8_t gpioPin;           // se for GPIO, qual pino físico usar
+    uint8_t pcaChannel;        // se for PCA9685, qual canal (0–15)
+
+    // Valores de controle
+    uint8_t currentValue;      // valor desejado (0–100%, 0–180°, 0/1)
+    uint8_t previousValue;     // último valor aplicado (para detectar mudança)
+    bool updated;              // flag interna de atualização (true = precisa aplicar)
+} DbServoChannel;
+
+/**
+ * @brief Estrutura principal para controle de servos/motores.
+ *        Agrupa os quatro canais físicos utilizados no sistema.
+ */
+typedef struct DB_SERVO_CONTROL {
+    DbServoChannel leftWhell;   // Servo da roda esquerda
+    DbServoChannel rightWhell;  // Servo da roda direita
+    DbServoChannel leftFront;   // Servo dianteiro esquerdo
+    DbServoChannel rightFront;  // Servo dianteiro direito
 } DbServoControl;
 
 typedef enum MOTION {
@@ -542,25 +578,52 @@ typedef struct DB_MACHINE{
     DbUpdate fwUpdate;
 } DbMachine;
 
+
+/**
+ * @brief Configuração e runtime do teste de 0→S.
+ */
+// Estados do 0→S
+typedef enum {
+  ZTS_IDLE = 0,   // parado (não armado)
+  ZTS_ARMED,      // armado, aguardando 0 km/h e primeira aceleração
+  ZTS_RUNNING,    // cronômetro contando
+  ZTS_FINISHED,   // concluiu 0→S
+  ZTS_ABORTED     // tempo esgotado/abandonou
+} DbZeroToSState;
+
+/**
+ * @brief Runtime do teste de 0→S.
+ */
+typedef struct {
+  DbZeroToSState state;     // estado atual
+  uint16_t targetKmh;       // S (alvo em km/h)
+  uint32_t tStartMs;        // (futuro) início cronometrado
+  uint32_t tEndMs;          // (futuro) fim cronometrado
+  float    lastSpeedKmh;    // (futuro) interp.
+  uint32_t lastSampleMs;    // (futuro) interp.
+  uint32_t zeroHoldStartMs; // (futuro) garantir 0 km/h estável
+} DbZeroToSRuntime;
+
+
 typedef struct DB_CAN_MONITOR {
-    float batteryVoltage;                        // PID 0x42 - Tensão da ECU (Ex: 12.0–14.8 V)
-    uint8_t intakeManifoldPressure;              // PID 0x0B - Pressão do coletor de admissão (0–255 kPa)
-    uint8_t throttlePosition;                    // PID 0x11 - Posição da borboleta (0–100 %)
+    float batteryVoltage;                       // PID 0x42 - Tensão da ECU (Ex: 12.0–14.8 V)
+    uint8_t intakeManifoldPressure;             // PID 0x0B - Pressão do coletor de admissão (0–255 kPa)
+    uint8_t throttlePosition;                   // PID 0x11 - Posição da borboleta (0–100 %)
     float ignitionTimingAdvance;                // PID 0x0E - Avanço de ignição (-64 a +63.5 °)
-    uint8_t calculatedLoadValue;                 // PID 0x04 - Carga calculada do motor (0–100 %)
-    uint8_t fuelLevel;                           // PID 0x2F - Nível de combustível (0–100 %)
-    uint16_t vehicleSpeed;                       // PID 0x0D - Velocidade do veículo (0–255 km/h)
-    uint16_t engineRPM;                          // PID 0x0C - Rotação do motor (0–16383.75 RPM)
-    signed int engineCoolantTemperature;            // PID 0x05 - Temperatura do líquido de arrefecimento (-40 a +215 °C)
-    signed int intakeAirTemperature;                 // PID 0x0F - Temperatura do ar admitido (-40 a +215 °C)
-    float massAirFlowRate;                       // PID 0x10 - Vazão de ar da MAF (0–655.35 g/s)
-    float fuelPressure;                          // PID 0x0A - Pressão do combustível (0–765 kPa)
-    float engineFuelRate;                        // PID 0x5E - Vazão de combustível (0–3212.75 L/h)
-    uint8_t ethanolFuelPercentage;               // PID 0x52 - Porcentagem de etanol (0–100 %)
-    uint16_t runTimeSinceEngineStart;            // PID 0x1F - Tempo de motor ligado (0–65535 s)
-    uint16_t distanceWithMILOn;                  // PID 0x21 - Distância com luz de falha acesa (0–65535 km)
-    uint16_t distanceSinceCodesCleared;          // PID 0x31 - Distância desde a limpeza dos códigos (0–65535 km)
-    uint16_t barometricPressure;                 // PID 0x33 - Pressão atmosférica (0–255 kPa)
+    uint8_t calculatedLoadValue;                // PID 0x04 - Carga calculada do motor (0–100 %)
+    uint8_t fuelLevel;                          // PID 0x2F - Nível de combustível (0–100 %)
+    uint16_t vehicleSpeed;                      // PID 0x0D - Velocidade do veículo (0–255 km/h)
+    uint16_t engineRPM;                         // PID 0x0C - Rotação do motor (0–16383.75 RPM)
+    signed int engineCoolantTemperature;        // PID 0x05 - Temperatura do líquido de arrefecimento (-40 a +215 °C)
+    signed int intakeAirTemperature;            // PID 0x0F - Temperatura do ar admitido (-40 a +215 °C)
+    float massAirFlowRate;                      // PID 0x10 - Vazão de ar da MAF (0–655.35 g/s)
+    float fuelPressure;                         // PID 0x0A - Pressão do combustível (0–765 kPa)
+    float engineFuelRate;                       // PID 0x5E - Vazão de combustível (0–3212.75 L/h)
+    uint8_t ethanolFuelPercentage;              // PID 0x52 - Porcentagem de etanol (0–100 %)
+    uint16_t runTimeSinceEngineStart;           // PID 0x1F - Tempo de motor ligado (0–65535 s)
+    uint16_t distanceWithMILOn;                 // PID 0x21 - Distância com luz de falha acesa (0–65535 km)
+    uint16_t distanceSinceCodesCleared;         // PID 0x31 - Distância desde a limpeza dos códigos (0–65535 km)
+    uint16_t barometricPressure;                // PID 0x33 - Pressão atmosférica (0–255 kPa)
 } DbCanMonitor;
 
 typedef struct DB_AUTOMOTIVE_SYSTEM {
@@ -569,7 +632,10 @@ typedef struct DB_AUTOMOTIVE_SYSTEM {
     bool     canExtended;   // true = 29 bits, false = 11 bits
     uint32_t canBaud;
     bool     canConnected;  // true = ECU respondeu, false = desconectado
+    uint32_t nextConnectionTimeout; // Timestamp para próxima tentativa de conexão
+    DbZeroToSRuntime zeroToS;
 } DbAutomotiveSystem;
+
 
 /////////////////////////////////////////////////////////////////////
 ///
@@ -652,6 +718,106 @@ typedef struct DB_IMG_MANAGER {
     uint32_t timestamp;         // timestamp Unix do momento de gravação
 } DbImgManager;
 
+
+
+
+
+
+/**
+ * @brief PIDs rápidos disponíveis para exibir em gauges.
+ *
+ * @note Mapeie estes PIDs com o que sua biblioteca OBD2 retorna.
+ */
+typedef enum DB_AUTOMOTIVE_GAUGE_PIDS {
+    AUTOMOTIVE_GAUGE_PID_RPM = 0,              /**< Rotação do motor (RPM) */
+    AUTOMOTIVE_GAUGE_PID_SPEED,                /**< Velocidade do veículo (km/h ou mph) */
+    AUTOMOTIVE_GAUGE_PID_COOLANT_TEMP,         /**< Temperatura do líquido de arrefecimento (°C/°F) */
+    AUTOMOTIVE_GAUGE_PID_THROTTLE_POS,         /**< Posição do acelerador (%) */
+    AUTOMOTIVE_GAUGE_CONTROL_MODULE_VOLTAGE,   /**< Tensão do módulo/alternador/bateria (V) */
+    AUTOMOTIVE_GAUGE_PID_FUEL_TANK_LEVEL,      /**< Nível de combustível (%) */
+    AUTOMOTIVE_GAUGE_PID_TOTAL
+} DbAutomotiveGaugePids;
+
+/**
+ * @brief Configuração de um “slot” de gauge (você tem 3 slots).
+ *
+ * @details
+ *  - Cada slot aponta para um PID e define a escala do gauge, níveis de aviso/alarme
+ *    e se a leitura deve ser invertida para o arco de LEDs (combustível, por exemplo).
+ *  - Ex.: para combustível: minScale=0, maxScale=100, warnLevel=15 (reserva),
+ *    alarmLevel=5, invert=true (LEDs “acendem” quanto MENOR a % restante).
+ */
+typedef struct DB_GAUGE_SLOT_CFG {
+    DbAutomotiveGaugePids pid;   /**< PID exibido neste slot */
+
+    int16_t  minScale;           /**< Menor valor na escala do gauge (ex.: 0 %) */
+    int16_t  maxScale;           /**< Maior valor na escala do gauge (ex.: 100 %) */
+    int16_t  warnLevel;          /**< Limite de aviso (nível médio / amarelo) */
+    int16_t  alarmLevel;         /**< Limite de alarme (nível máximo / vermelho) */
+
+    bool     invert;             /**< true = inverte mapeamento p/ LEDs (útil p/ combustível) */
+    uint8_t  decimals;           /**< Casas decimais p/ exibir no número central */
+    char     unit[8];            /**< Unidade curta opcional ("RPM","km/h","%","C","F","V") */
+} DbGaugeSlotCfg;
+
+/**
+ * @brief Parâmetros padrão por tipo de PID (globais).
+ *
+ * @details
+ *  - Valores usados como base quando um slot é criado/trocado para um PID.
+ *  - Pode manter “coerência” entre telas sem duplicar números em cada slot.
+ *  - Árbitros típicos (ajuste ao seu projeto/carro/alvo).
+ */
+typedef struct DB_AUTOMOTIVE_PID_DEFAULTS {
+    // RPM
+    uint16_t rpmWarn;              /**< Ex.: 6000 RPM */
+    uint16_t rpmAlarm;             /**< Ex.: 7000 RPM */
+
+    // Velocidade
+    uint16_t speedMaxScale;        /**< Ex.: 240 km/h */
+    uint16_t speedWarn;            /**< Ex.: 120 km/h (amarelo) */
+    uint16_t speedAlarm;           /**< Ex.: 180 km/h (vermelho) */
+
+    // Temperatura do arrefecimento (°C)
+    int16_t  coolantMin;           /**< Ex.: 60 °C (abaixo disso ainda “frio”) */
+    int16_t  coolantWarn;          /**< Ex.: 95 °C (amarelo) */
+    int16_t  coolantAlarm;         /**< Ex.: 105 °C (vermelho) */
+
+    // Combustível (%)
+    uint8_t  fuelMin;              /**< Ex.: 0 %  */
+    uint8_t  fuelReserve;          /**< Ex.: 15 % (amarelo) */
+    uint8_t  fuelMax;              /**< Ex.: 100 % */
+
+    // Tensão (x10 para guardar com inteiros; 118 = 11.8 V)
+    uint16_t voltWarn_dV;          /**< Ex.: 118 (11.8 V) */
+    uint16_t voltAlarm_dV;         /**< Ex.: 112 (11.2 V) */
+} DbAutomotivePidDefaults;
+
+/**
+ * @brief Configuração automotiva completa (NVS).
+ *
+ * @details
+ *  - currGaugeIndex: qual dos 3 slots está ativo (0..2);
+ *  - slots[3]: configuração de cada gauge da sua “rotação”;
+ *  - defaults: valores padrão por PID (base para popular slots);
+ *  - unitSystem: 0=SI (km/h, °C), 1=Imperial (mph, °F);
+ *  - smoothingPct: filtro 0..100 (0=sem filtro, 100=congela).
+ */
+typedef struct DB_AUTOMOTIVE_CONFIG {
+    uint8_t              currGaugeIndex;   /**< 0..2 → slot ativo */
+    DbGaugeSlotCfg       slots[TOTAL_AUTOMOTIVE_GAUGES];         /**< Três gauges configuráveis */
+    DbAutomotivePidDefaults defaults;      /**< Defaults globais por PID */
+    uint8_t              unitSystem;       /**< 0=SI, 1=Imperial */
+    uint8_t              smoothingPct;     /**< Suavização simples 0..100 % */
+    uint16_t zeroToS_target_kmh;   // NOVO: alvo do 0→S (km/h) - Default = 100
+} DbAutomotiveConfig;
+
+typedef union DB_NVS_AUTOMOTIVE_CONFIG {
+    DbAutomotiveConfig cfgMemory;
+    uint8_t bufferMemory[MEMORY_LONG_BUFF_LENGTH];
+} DbNvsAutomotiveConfig;
+
+
 /**
  * @brief NVS - CONFIGURACOES GERAIS 
  */
@@ -663,6 +829,7 @@ typedef struct DB_NIKO_PARAMETERS {
     unsigned long timeGetDataFromHost; // tempo de requisicao de dados de algum host.
     DbPeriodicMaintenance maintence;
     bool buzzerEnabled;
+    DbAutomotiveGaugePids currAutomotiveGaugeView;
     uint8_t muscInit;
     uint8_t telaInit;
     uint8_t imgClock;
@@ -674,9 +841,6 @@ typedef union DB_NVS_CONFIG {
     DbNikoConfig cfgMemory;
     uint8_t bufferMemory[MEMORY_BUFF_LENGTH_10_BIT];
 } DbNvsNikoConfig;
-
-
-
 
 
 #endif /* SYSTEM_STRUCTURES_H_ */

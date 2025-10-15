@@ -2,7 +2,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 /** @brief Tasks do sistema*/
-#include "taskManager/Tasks/canTask.hpp"
+#include "taskManager/Tasks/sensorsTask.hpp"
+#include "taskManager/Tasks/obd2Task.hpp"
+#include "taskManager/Tasks/ServoTask.hpp"
 
 /**
  * @brief Converte o valor em kilobytes para o valor equivalente em palavras de stack (StackType_t).
@@ -26,7 +28,7 @@
 #define DISPLAY_TASK_PRIORITY 8
 #define BUZZER_TASK_PRIORITY 7
 #define LED_TASK_PRIORITY 6
-#define CAN_TASK_PRIORITY 5
+#define OBD2_TASK_PRIORITY 5
 #define GYROSCOPE_TASK_PRIORITY 4
 #define LEMBRETES_TASK_PRIORITY 3
 
@@ -54,8 +56,10 @@ void taskMAnager_init(SystemStatus *systemStatus) {
         printf("Erro ao criar o mutex\n");
         return;
     }
-
-    xTaskCreate(canTask_run, TASK_NAME_CAN, SIZE_TASK_STACK(6), systemStatus, CAN_TASK_PRIORITY, NULL);
+    xTaskCreate(obd2Task_run, TASK_NAME_OBD2, SIZE_TASK_STACK(6), systemStatus, OBD2_TASK_PRIORITY, NULL);
+    // xTaskCreate(sensors_Task, TASK_NAME_SENSORS, SIZE_TASK_STACK(2), systemStatus, SENSORS_TASK_PRIORITY, NULL); // atualizada
+    xTaskCreate(servo_Task, TASK_NAME_SERVO, SIZE_TASK_STACK(4), systemStatus, SENSORS_TASK_PRIORITY, NULL); // atualizada
+    
 
     systemStatus->machine.allTasksInitialized = true;
 }

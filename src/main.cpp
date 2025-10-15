@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <SPI.h>
 #include <esp_idf_version.h>
 #include <main.h>
 #include "Database/Structures/systemStatus.h"
