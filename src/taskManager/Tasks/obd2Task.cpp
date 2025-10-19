@@ -9,9 +9,10 @@
 #include "Peripheral/ServoControl/servoControl.hpp"  // Controle via PCA/MUX
 
 // =============================================================
-// ===================== CONFIGURAÇÕES GERAIS ==================
+// =============== CONFIGURAÇÕES / CONSTANTES ==================
 // =============================================================
 
+// Debug local do task
 #define OBD2_TASK_DEBUG_ENABLE
 #ifdef OBD2_TASK_DEBUG_ENABLE
   #define OBD2_TASK_DEBUG_PRINT(...)   { Serial.print(__VA_ARGS__); }
@@ -23,36 +24,54 @@
   #define OBD2_TASK_DEBUG_PRINTF(...)
 #endif
 
-// =============================================================
-// ===================== CONFIG CAN / K-LINE ====================
-// =============================================================
+// ---- Utilidades legíveis (evita 1/0 espalhado) ----
+static inline uint8_t BOOL_TO_U8(bool b){ return b ? 1U : 0U; }
 
-// Pinos de comunicação (K-Line compartilha pinos com CAN via MUX)
-#define KLINE_RX_PIN           PIN_PCI_ATHENAS_CAN_RX   // RX ← L9637D TX
-#define KLINE_TX_PIN           PIN_PCI_ATHENAS_CAN_TX   // TX → L9637D RX
-#define KLINE_BAUDRATE         10400                    // Baud ISO9141/KWP2000
+// ---- Pinos compartilhados (via MUX PCA) ----
+#define KLINE_RX_PIN                 PIN_PCI_ATHENAS_CAN_RX   // RX ← L9637D TX
+#define KLINE_TX_PIN                 PIN_PCI_ATHENAS_CAN_TX   // TX → L9637D RX
+#define KLINE_BAUDRATE               10400U                   // ISO9141/KWP2000
 
-// Canal físico no PCA que controla o MUX
-#define MUX_CHANNEL            3
+// ---- Canal do PCA que comanda o MUX (seu hardware) ----
+#define MUX_CHANNEL                  3
 
-// Estados lógicos do MUX
-#define MUX_CAN_ACTIVE         0   // LOW → habilita transceptor CAN (SN65HVD230)
-#define MUX_KLINE_ACTIVE       1   // HIGH → habilita transceptor K-Line (L9637D)
+// ---- Estados lógicos do MUX ----
+#define MUX_CAN_ACTIVE               0U   // LOW  → habilita CAN
+#define MUX_KLINE_ACTIVE             1U   // HIGH → habilita K-Line
 
-// Intervalos entre tentativas de reconexão
-#define CAN_RETRY_INTERVAL_MS   5000
-#define KLINE_RETRY_INTERVAL_MS 5000
+// ---- Intervalos de comutação/espera ----
+#define MUX_SETTLE_MS                500U   // tempo para o MUX “assentar”
+#define CAN_DRIVER_STABILIZE_MS      300U
+
+// ---- Intervalos de retry de conexão ----
+#define CAN_RETRY_INTERVAL_MS        5000U
+#define KLINE_RETRY_INTERVAL_MS      5000U
+
+// ---- Coleta via CAN / K-Line (dados) ----
+#define CAN_POLL_INTERVAL_MS         500U     // exemplo: RPM via CAN
+// K-Line: foco em **coleta mais rápida**
+#define KLINE_POLL_INTERVAL_1PID_MS  120U     // ~120 ms para 1 PID (ajuste fino ok)
+#define KLINE_POLL_INTERVAL_2PID_MS  200U     // ~200 ms para 2 PIDs (se alternar)
+
+// ---- Timeouts K-Line (mais agressivos) ----
+#define KLINE_INTERBYTE_TIMEOUT_MS   20U
+#define KLINE_READ_TIMEOUT_MS        250U
+
+// ---- PIDs que usamos (mantém nomes sem “número mágico”) ----
+#define PID_ENGINE_RPM               ENGINE_RPM    // (0x0C) já vem do athenasObd2.h
+#define PID_VEHICLE_SPEED            VEHICLE_SPEED // (0x0D)
+
+// Acima, defina:
+#define KLINE_MAX_FAILS 3
 
 // =============================================================
 // ===================== INSTÂNCIAS =============================
 // =============================================================
-
 static OBD2_KLine KLine(Serial1, KLINE_BAUDRATE, KLINE_RX_PIN, KLINE_TX_PIN);
 
 // =============================================================
 // ===================== ENUM DE ESTADOS ========================
 // =============================================================
-
 typedef enum {
     OBD_MODE_TRY_CAN = 0,   // Tentando conectar via CAN
     OBD_MODE_CAN_ACTIVE,    // Comunicação ativa via CAN
@@ -62,33 +81,31 @@ typedef enum {
 
 static ObdProtocolMode obdMode = OBD_MODE_TRY_CAN;
 
+
 // =============================================================
 // ===================== FUNÇÕES AUXILIARES ====================
 // =============================================================
 
 /**
- * @brief Controla o pino físico do MUX via PCA9685.
- * 
+ * @brief Controla a linha do MUX via PCA9685.
  * HIGH (1) → ativa K-Line
  * LOW  (0) → ativa CAN
  */
 static void setMuxState(SystemStatus* ss, bool useKLine)
 {
-    DbServoChannel* muxCh = &ss->machine.servo.leftFront;  // canal físico no PCA
-    muxCh->mode = SERVO_MODE_GPIO;     // força modo GPIO digital
-    muxCh->pcaChannel = MUX_CHANNEL;   // CH4
+    DbServoChannel* muxCh = &ss->machine.servo.leftFront; // use o canal reservado ao MUX
+    muxCh->mode         = SERVO_MODE_GPIO;
+    muxCh->pcaChannel   = MUX_CHANNEL;
     muxCh->currentValue = useKLine ? MUX_KLINE_ACTIVE : MUX_CAN_ACTIVE;
-    muxCh->updated = true;
+    muxCh->updated      = true;
 
-    OBD2_TASK_DEBUG_PRINTF("[MUX] Estado → %s (CH%d = %d)\n",
+    OBD2_TASK_DEBUG_PRINTF("[MUX] Estado → %s (CH%d = %u)\n",
         useKLine ? "K-LINE" : "CAN",
         MUX_CHANNEL,
-        muxCh->currentValue);
+        (unsigned)muxCh->currentValue);
 }
 
-/**
- * @brief Zera todos os valores de PIDs monitorados.
- */
+/** Zera os valores monitorados (visual limpo quando desconecta). */
 static void resetValuePIDs(SystemStatus *s)
 {
     s->automotiveSystem.canMonitor.engineRPM                 = 0;
@@ -103,6 +120,7 @@ static void resetValuePIDs(SystemStatus *s)
     s->automotiveSystem.canMonitor.massAirFlowRate           = 0;
 }
 
+
 // =============================================================
 // ===================== TASK PRINCIPAL ========================
 // =============================================================
@@ -110,98 +128,85 @@ void obd2Task_run(void *pvParameters)
 {
     SystemStatus *systemStatus = (SystemStatus *)pvParameters;
 
+    static int klineFails = 0;
     uint32_t lastSwitchAttempt = 0;
-    uint32_t lastRequest = 0;
-    uint32_t lastLog = 0;
-    bool connected = false;
+    uint32_t lastRequest       = 0;
+    uint32_t lastLog           = 0;
+    bool     klineConnected    = false;  // estado interno para K-Line
 
     OBD2_TASK_DEBUG_PRINTLN("\n=======================================");
     OBD2_TASK_DEBUG_PRINTLN("   OBD2 AUTO-SYNC TASK (CAN <-> KLINE)");
     OBD2_TASK_DEBUG_PRINTLN("=======================================\n");
 
-    vTaskDelay(pdMS_TO_TICKS(2000));  // Aguarda inicialização completa
+    vTaskDelay(pdMS_TO_TICKS(2000));  // Aguarda inicialização completa do sistema
 
-    // ----------------------------------------------------------
-    // Configuração inicial do driver CAN
-    // ----------------------------------------------------------
+    // ---- CAN (TWAI) ----
     CAN0.setCANPins((gpio_num_t)PIN_PCI_ATHENAS_CAN_RX, (gpio_num_t)PIN_PCI_ATHENAS_CAN_TX);
     OBD2.setTimeout(TIME_TO_REQUEST_CAN_PID);
-    OBD2.setHeartbeatPid(ENGINE_RPM);
+    OBD2.setHeartbeatPid(PID_ENGINE_RPM);
     OBD2.setHeartbeatInterval(1000);
     OBD2.setBackoff(1000, 8000);
     OBD2.setReconnectInterval(20000);
 
-    // ----------------------------------------------------------
-    // Configuração inicial do driver K-Line
-    // ----------------------------------------------------------
-    KLine.setDebug(Serial);
+    // ---- K-Line (logs internos DESLIGADOS: não chamamos setDebug) ----
     KLine.setProtocol("Automatic");
     KLine.setByteWriteInterval(5);
-    KLine.setInterByteTimeout(60);
-    KLine.setReadTimeout(1000);
+    KLine.setInterByteTimeout(KLINE_INTERBYTE_TIMEOUT_MS);
+    KLine.setReadTimeout(KLINE_READ_TIMEOUT_MS);
 
     resetValuePIDs(systemStatus);
 
-    // ==========================================================
-    // LOOP PRINCIPAL (FSM - Máquina de Estados)
-    // ==========================================================
     for (;;)
     {
         switch (obdMode)
         {
             // ==========================================================
-            // 1️⃣ Tentativa de inicializar CAN
+            // 1) Tentativa via CAN
             // ==========================================================
             case OBD_MODE_TRY_CAN:
                 OBD2_TASK_DEBUG_PRINTLN("[FSM] Tentando comunicação via CAN...");
 
-                // Desliga K-Line e comuta MUX para modo CAN
                 KLine.powerDownBus();
-                setMuxState(systemStatus, false);      // Força MUX em modo CAN
-                OBD2_TASK_DEBUG_PRINTLN("[MUX] 🕒 Aguardando estabilização (500 ms)...");
-                vTaskDelay(pdMS_TO_TICKS(500));        // Aguarda troca física
+                setMuxState(systemStatus, false);
+                OBD2_TASK_DEBUG_PRINTLN("[MUX] Aguardando estabilização...");
+                vTaskDelay(pdMS_TO_TICKS(MUX_SETTLE_MS));
 
-                // Inicializa o driver CAN após a comutação
                 OBD2.beginAuto();
-                vTaskDelay(pdMS_TO_TICKS(300));        // Aguarda driver estabilizar
+                vTaskDelay(pdMS_TO_TICKS(CAN_DRIVER_STABILIZE_MS));
 
                 if (OBD2.connected())
                 {
                     OBD2_TASK_DEBUG_PRINTLN("✅ Comunicação CAN estabelecida!");
                     obdMode = OBD_MODE_CAN_ACTIVE;
-                    connected = true;
                     break;
                 }
 
                 OBD2_TASK_DEBUG_PRINTLN("❌ Falha no CAN. Tentando K-Line...");
-                OBD2.end();  // encerra driver CAN antes de trocar
-                connected = false;
-                obdMode = OBD_MODE_TRY_KLINE;
+                OBD2.end();
+                obdMode           = OBD_MODE_TRY_KLINE;
                 lastSwitchAttempt = millis();
                 break;
 
             // ==========================================================
-            // 2️⃣ Comunicação CAN ativa
+            // 2) CAN ativo
             // ==========================================================
             case OBD_MODE_CAN_ACTIVE:
-                OBD2.tick();
+                OBD2.tick(); // mantém FSM da lib viva
 
                 if (!OBD2.connected())
                 {
                     OBD2_TASK_DEBUG_PRINTLN("⚠️ CAN desconectado. Alternando para K-Line...");
                     OBD2.end();
-                    connected = false;
-                    obdMode = OBD_MODE_TRY_KLINE;
+                    obdMode           = OBD_MODE_TRY_KLINE;
                     lastSwitchAttempt = millis();
                     break;
                 }
 
-                // Leitura periódica de RPM via CAN
-                if (millis() - lastRequest >= 500)
+                if ((millis() - lastRequest) >= CAN_POLL_INTERVAL_MS)
                 {
                     lastRequest = millis();
                     float rpm = 0.0f;
-                    if (OBD2.readPid(ENGINE_RPM, rpm))
+                    if (OBD2.readPid(PID_ENGINE_RPM, rpm))
                     {
                         systemStatus->automotiveSystem.canMonitor.engineRPM = rpm;
                         OBD2_TASK_DEBUG_PRINTF("🔥 [CAN] RPM: %.0f\n", rpm);
@@ -210,25 +215,23 @@ void obd2Task_run(void *pvParameters)
                 break;
 
             // ==========================================================
-            // 3️⃣ Tentativa de inicializar K-Line
+            // 3) Tentativa via K-Line
             // ==========================================================
             case OBD_MODE_TRY_KLINE:
-                if (millis() - lastSwitchAttempt < KLINE_RETRY_INTERVAL_MS)
-                    break;  // evita flood de tentativas
+                if ((millis() - lastSwitchAttempt) < KLINE_RETRY_INTERVAL_MS)
+                    break;  // evita flood
 
                 OBD2_TASK_DEBUG_PRINTLN("[FSM] Tentando comunicação via K-Line...");
 
-                // Desliga CAN e comuta MUX para modo K-Line
                 OBD2.end();
-                setMuxState(systemStatus, true);        // Força MUX em modo K-Line
-                OBD2_TASK_DEBUG_PRINTLN("[MUX] 🕒 Aguardando estabilização (500 ms)...");
-                vTaskDelay(pdMS_TO_TICKS(500));         // Aguarda troca física
+                setMuxState(systemStatus, true);
+                OBD2_TASK_DEBUG_PRINTLN("[MUX] Aguardando estabilização...");
+                vTaskDelay(pdMS_TO_TICKS(MUX_SETTLE_MS));
 
-                // Inicializa driver UART/K-Line após estabilização
                 KLine.setSerial(true);
-                connected = KLine.initOBD2();
+                klineConnected = KLine.initOBD2();
 
-                if (connected)
+                if (klineConnected)
                 {
                     OBD2_TASK_DEBUG_PRINTLN("✅ Comunicação K-Line estabelecida!");
                     obdMode = OBD_MODE_KLINE_ACTIVE;
@@ -237,53 +240,68 @@ void obd2Task_run(void *pvParameters)
 
                 OBD2_TASK_DEBUG_PRINTLN("❌ Falha na K-Line. Voltando ao CAN...");
                 KLine.powerDownBus();
-                obdMode = OBD_MODE_TRY_CAN;
+                obdMode           = OBD_MODE_TRY_CAN;
                 lastSwitchAttempt = millis();
                 break;
 
             // ==========================================================
-            // 4️⃣ Comunicação K-Line ativa
+            // 4) K-Line ativa
             // ==========================================================
             case OBD_MODE_KLINE_ACTIVE:
-                if (!connected)
+            {
+                if (!klineConnected)
                 {
                     obdMode = OBD_MODE_TRY_CAN;
                     break;
                 }
 
-                // Leitura de RPM a cada 2 segundos
-                if (millis() - lastRequest >= 2000)
+                if ((millis() - lastRequest) >= KLINE_POLL_INTERVAL_1PID_MS)
                 {
                     lastRequest = millis();
+                    float rpm = KLine.getPID(read_LiveData, PID_ENGINE_RPM);
 
-                    float rpm = KLine.getPID(read_LiveData, 0x0C);
-                    if (rpm > 0)
+                    if (rpm >= 0.0f)
                     {
                         systemStatus->automotiveSystem.canMonitor.engineRPM = rpm;
+                        klineFails = 0;
                         OBD2_TASK_DEBUG_PRINTF("🔥 [KLINE] RPM: %.0f\n", rpm);
                     }
                     else
                     {
-                        OBD2_TASK_DEBUG_PRINTLN("❌ Falha ao ler PID. Voltando ao modo CAN...");
-                        KLine.powerDownBus();
-                        connected = false;
-                        obdMode = OBD_MODE_TRY_CAN;
-                        lastSwitchAttempt = millis();
+                        klineFails++;
+                        OBD2_TASK_DEBUG_PRINTF("⚠️ [KLINE] Falha %d/%d ao ler RPM\n",
+                                                klineFails, KLINE_MAX_FAILS);
+
+                        if (klineFails >= KLINE_MAX_FAILS)
+                        {
+                            OBD2_TASK_DEBUG_PRINTLN("❌ [KLINE] Falhas consecutivas. Voltando ao CAN...");
+                            KLine.powerDownBus();
+                            klineConnected    = false;
+                            obdMode           = OBD_MODE_TRY_CAN;
+                            lastSwitchAttempt = millis();
+                            klineFails        = 0;
+                        }
                     }
                 }
-                break;
-        }
 
-        // ==========================================================
-        // Log de status periódico (3 s)
-        // ==========================================================
-        if (millis() - lastLog >= 3000)
+                // (Opcional) manter sessão ativa se a lib expuser tester-present:
+                // if (millis() - lastKeepAlive >= 1800) { KLine.testerPresent(); lastKeepAlive = millis(); }
+
+                break;
+            }
+
+        } // <-- Faltava essa chave de fechamento do switch!
+
+        // ---- Log de status a cada 3 s ----
+        const uint32_t STATUS_LOG_PERIOD_MS = 3000U;
+        static uint32_t lastStatusLog = 0;
+        if ((millis() - lastStatusLog) >= STATUS_LOG_PERIOD_MS)
         {
-            lastLog = millis();
-            OBD2_TASK_DEBUG_PRINTF("[STATUS] Modo: %d | CAN: %d | KLine: %d | RPM: %.0f\n",
-                                   obdMode,
-                                   (OBD2.connected() ? 1 : 0),
-                                   (connected ? 1 : 0),
+            lastStatusLog = millis();
+            OBD2_TASK_DEBUG_PRINTF("[STATUS] Modo:%d | CAN:%u | KLine:%u | RPM:%.0f\n",
+                                   (int)obdMode,
+                                   BOOL_TO_U8(OBD2.connected()),
+                                   BOOL_TO_U8(klineConnected),
                                    systemStatus->automotiveSystem.canMonitor.engineRPM);
         }
 
