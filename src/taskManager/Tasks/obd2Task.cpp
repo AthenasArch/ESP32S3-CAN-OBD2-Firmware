@@ -341,31 +341,7 @@ static void collectSelectedGauge(SystemStatus* ss)
 
 //         vTaskDelay(pdMS_TO_TICKS(10));
 //     }
-// }
-
-
-
-void testServoControl(SystemStatus* systemStatus)
-{
-    static uint32_t lastToggle = 0;
-    static bool state = false;
-
-    DbServoChannel* ch = &systemStatus->machine.servo.leftFront;
-    ch->mode = SERVO_MODE_GPIO;    // ativa modo GPIO no PCA
-    ch->pcaChannel = 4;            // canal físico CH4 do PCA
-    ch->updated = true;
-
-    if (millis() - lastToggle >= 10000)
-    {
-        lastToggle = millis();
-        state = !state;
-        ch->currentValue = state ? 1 : 0;
-        ch->updated = true;
-        Serial.printf("[testServoControl] ⚡ CH%d -> %s\n", ch->pcaChannel, state ? "HIGH" : "LOW");
-    }
-}
-
-
+// } 
 
 
 // =============================================================
@@ -393,33 +369,40 @@ void obd2Task_run(void *pvParameters)
 
     vTaskDelay(pdMS_TO_TICKS(2000));  // Aguarda o sistema estabilizar
 
-    // Inicializa a UART (Serial1)
-    Serial1.begin(KLINE_BAUDRATE, SERIAL_8N1, KLINE_RX_PIN, KLINE_TX_PIN);
-
     // === Configurações de protocolo e debug ===
-    // KLine.setDebug(Serial);
-    // KLine.setSerial(true);
-    KLine.setProtocol("Automatic");   // Auto: tenta ISO9141 e ISO14230
+    KLine.setDebug(Serial);
+    KLine.setProtocol("Automatic");   // Tenta ISO9141 e ISO14230
     KLine.setByteWriteInterval(5);
     KLine.setInterByteTimeout(60);
     KLine.setReadTimeout(1000);
+    KLine.setSerial(true);            // Inicializa UART e mantém TX em idle HIGH
 
     unsigned long lastRequest = millis();
     unsigned long lastLog = millis();
     unsigned long taskTimer = millis();
 
     bool connected = false;
+    uint32_t lastReconnectAttempt = 0;
 
     for (;;)
     {
-        testServoControl(systemStatus); // função de teste do servo
         task_checkUsedMem(TASK_NAME_OBD2, &taskTimer);
 
-        // === Etapa de inicialização automática ===
+        // ============================================================
+        // === Tenta conexão automática se ainda não estiver conectada
+        // ============================================================
         if (!connected)
         {
-            OBD2_TASK_DEBUG_PRINTLN("Iniciando comunicação com ECU...");
-            connected = KLine.initOBD2();  // método oficial da biblioteca
+            // Aguarda 5 segundos entre tentativas
+            if (millis() - lastReconnectAttempt < 5000)
+            {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+
+            OBD2_TASK_DEBUG_PRINTLN("🔄 Tentando estabelecer comunicação com ECU...");
+            lastReconnectAttempt = millis();
+            connected = KLine.initOBD2();
 
             if (connected)
             {
@@ -428,34 +411,21 @@ void obd2Task_run(void *pvParameters)
             }
             else
             {
-                OBD2_TASK_DEBUG_PRINTLN("❌ Falha ao inicializar K-Line. Tentando novamente...");
+                OBD2_TASK_DEBUG_PRINTLN("❌ Falha ao inicializar K-Line. Tentando novamente em 5s...");
                 systemStatus->automotiveSystem.canConnected = false;
-                vTaskDelay(pdMS_TO_TICKS(2000));
+
+                KLine.powerDownBus();  // desliga UART e libera pinos
+                vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;
             }
         }
 
-        // === Leitura de PIDs suportados (modo 01) ===
+        // ============================================================
+        // === Comunicação ativa: leitura de dados a cada 2 segundos ===
+        // ============================================================
         if (millis() - lastRequest >= 2000)
         {
             lastRequest = millis();
-            OBD2_TASK_DEBUG_PRINTLN("🔍 Solicitando PIDs suportados (modo 0x01)");
-
-            int liveDataLength = KLine.readSupportedLiveData();
-            if (liveDataLength > 0)
-            {
-                OBD2_TASK_DEBUG_PRINTF("LiveData suportado (%d): ", liveDataLength);
-                for (int i = 0; i < liveDataLength; i++)
-                {
-                    byte pid = KLine.getSupportedData(0x01, i);
-                    Serial.printf("%02X ", pid);
-                }
-                Serial.println();
-            }
-            else
-            {
-                OBD2_TASK_DEBUG_PRINTLN("⚠️ Nenhum PID suportado retornado ou falha na leitura.");
-            }
 
             // === Leitura de RPM (PID 0x0C) ===
             OBD2_TASK_DEBUG_PRINTLN("🔁 Solicitando PID 0x0C (Engine RPM)...");
@@ -468,11 +438,17 @@ void obd2Task_run(void *pvParameters)
             }
             else
             {
-                OBD2_TASK_DEBUG_PRINTLN("❌ Falha ao ler PID 0x0C.");
+                OBD2_TASK_DEBUG_PRINTLN("❌ Falha ao ler PID 0x0C. Tentando reconectar...");
+                connected = false;  // força nova tentativa
+                KLine.powerDownBus();
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
             }
         }
 
-        // === Log periódico de status ===
+        // ============================================================
+        // === Log periódico de status
+        // ============================================================
         if (millis() - lastLog >= 3000)
         {
             lastLog = millis();
@@ -482,6 +458,6 @@ void obd2Task_run(void *pvParameters)
                                    systemStatus->automotiveSystem.canMonitor.engineRPM);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

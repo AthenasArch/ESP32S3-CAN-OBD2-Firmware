@@ -21,12 +21,12 @@
 #define PCA_RETRY_INTERVAL_MS  1000
 
 // Quantidade de canais disponíveis (máx. 16 no PCA9685)
-#define SERVO_CHANNEL_COUNT    4   // pode ser aumentado futuramente
+#define SERVO_CHANNEL_COUNT    4   // pode ser aumentado futuramente 
 
 // =============================================================
 // ===================== DEBUG OPCIONAL =========================
 // =============================================================
-#define SERVO_CONTROL_DEBUG_ENABLE
+// #define SERVO_CONTROL_DEBUG_ENABLE
 #ifdef SERVO_CONTROL_DEBUG_ENABLE
   #define SERVO_CONTROL_DEBUG_PRINT(...)   { Serial.print(__VA_ARGS__); }
   #define SERVO_CONTROL_DEBUG_PRINTLN(...) { Serial.println(__VA_ARGS__); }

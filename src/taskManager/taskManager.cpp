@@ -56,7 +56,7 @@ void taskMAnager_init(SystemStatus *systemStatus) {
         printf("Erro ao criar o mutex\n");
         return;
     }
-    xTaskCreate(obd2Task_run, TASK_NAME_OBD2, SIZE_TASK_STACK(6), systemStatus, OBD2_TASK_PRIORITY, NULL);
+    xTaskCreate(obd2Task_run, TASK_NAME_OBD2, SIZE_TASK_STACK(8), systemStatus, OBD2_TASK_PRIORITY, NULL);
     // xTaskCreate(sensors_Task, TASK_NAME_SENSORS, SIZE_TASK_STACK(2), systemStatus, SENSORS_TASK_PRIORITY, NULL); // atualizada
     xTaskCreate(servo_Task, TASK_NAME_SERVO, SIZE_TASK_STACK(4), systemStatus, SENSORS_TASK_PRIORITY, NULL); // atualizada
     
@@ -97,4 +97,4 @@ void task_checkUsedMem(const char *strName, unsigned long *timerTask) {
         Serial.printf("[STACK] Task: %s | Bytes livres: %u\n", strName, bytesLivres);
     }
 #endif
-}
+} 
