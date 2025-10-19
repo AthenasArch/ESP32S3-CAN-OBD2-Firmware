@@ -6,6 +6,11 @@
 #include "taskManager/Tasks/obd2Task.hpp"
 #include "taskManager/taskManager.h"
 #include "OBD2_KLine.h"
+#include "Peripheral/ServoControl/servoControl.hpp"  // Controle via PCA/MUX
+
+// =============================================================
+// ===================== CONFIGURAÇÕES GERAIS ==================
+// =============================================================
 
 #define OBD2_TASK_DEBUG_ENABLE
 #ifdef OBD2_TASK_DEBUG_ENABLE
@@ -18,15 +23,72 @@
   #define OBD2_TASK_DEBUG_PRINTF(...)
 #endif
 
-// Timers
-static uint32_t lastFast = 0;
-static uint32_t lastMed  = 0;
-static uint32_t lastSlow = 0;
-static uint32_t lastLog  = 0;
+// =============================================================
+// ===================== CONFIG CAN / K-LINE ====================
+// =============================================================
 
-static void collectSelectedGauge(SystemStatus* ss);
+// Pinos de comunicação (K-Line compartilha pinos com CAN via MUX)
+#define KLINE_RX_PIN           PIN_PCI_ATHENAS_CAN_RX   // RX ← L9637D TX
+#define KLINE_TX_PIN           PIN_PCI_ATHENAS_CAN_TX   // TX → L9637D RX
+#define KLINE_BAUDRATE         10400                    // Baud ISO9141/KWP2000
 
-// ---------- Auxiliares ----------
+// Canal físico no PCA que controla o MUX
+#define MUX_CHANNEL            3
+
+// Estados lógicos do MUX
+#define MUX_CAN_ACTIVE         0   // LOW → habilita transceptor CAN (SN65HVD230)
+#define MUX_KLINE_ACTIVE       1   // HIGH → habilita transceptor K-Line (L9637D)
+
+// Intervalos entre tentativas de reconexão
+#define CAN_RETRY_INTERVAL_MS   5000
+#define KLINE_RETRY_INTERVAL_MS 5000
+
+// =============================================================
+// ===================== INSTÂNCIAS =============================
+// =============================================================
+
+static OBD2_KLine KLine(Serial1, KLINE_BAUDRATE, KLINE_RX_PIN, KLINE_TX_PIN);
+
+// =============================================================
+// ===================== ENUM DE ESTADOS ========================
+// =============================================================
+
+typedef enum {
+    OBD_MODE_TRY_CAN = 0,   // Tentando conectar via CAN
+    OBD_MODE_CAN_ACTIVE,    // Comunicação ativa via CAN
+    OBD_MODE_TRY_KLINE,     // Tentando conectar via K-Line
+    OBD_MODE_KLINE_ACTIVE   // Comunicação ativa via K-Line
+} ObdProtocolMode;
+
+static ObdProtocolMode obdMode = OBD_MODE_TRY_CAN;
+
+// =============================================================
+// ===================== FUNÇÕES AUXILIARES ====================
+// =============================================================
+
+/**
+ * @brief Controla o pino físico do MUX via PCA9685.
+ * 
+ * HIGH (1) → ativa K-Line
+ * LOW  (0) → ativa CAN
+ */
+static void setMuxState(SystemStatus* ss, bool useKLine)
+{
+    DbServoChannel* muxCh = &ss->machine.servo.leftFront;  // canal físico no PCA
+    muxCh->mode = SERVO_MODE_GPIO;     // força modo GPIO digital
+    muxCh->pcaChannel = MUX_CHANNEL;   // CH4
+    muxCh->currentValue = useKLine ? MUX_KLINE_ACTIVE : MUX_CAN_ACTIVE;
+    muxCh->updated = true;
+
+    OBD2_TASK_DEBUG_PRINTF("[MUX] Estado → %s (CH%d = %d)\n",
+        useKLine ? "K-LINE" : "CAN",
+        MUX_CHANNEL,
+        muxCh->currentValue);
+}
+
+/**
+ * @brief Zera todos os valores de PIDs monitorados.
+ */
 static void resetValuePIDs(SystemStatus *s)
 {
     s->automotiveSystem.canMonitor.engineRPM                 = 0;
@@ -41,420 +103,187 @@ static void resetValuePIDs(SystemStatus *s)
     s->automotiveSystem.canMonitor.massAirFlowRate           = 0;
 }
 
-// <<< PROTEÇÃO: nunca tenta ler PID se o driver/barramento não está pronto
-static inline bool readPidSafe(uint8_t pid, float &out)
-{
-    if (!OBD2.connected()) return false;  // <<< guarda-chuva contra fila nula
-    return OBD2.readPid(pid, out);
-}
-
-/**
- * Coleta os PIDs rápidos (RPM e, se for o gauge ativo, SPEED).
- * Deve ser chamado a cada ~300 ms (ou menos).
- * RPM é sempre lido; SPEED só se o gauge ativo for SPEED.
- * @param st ponteiro para SystemStatus
- */
-static void collectFast(SystemStatus *st)
-{
-    const uint8_t idx = st->nvsAutomotiveConfig.cfgMemory.currGaugeIndex % TOTAL_AUTOMOTIVE_GAUGES;
-
-    float v;
-
-    if (idx == 3) {
-        // Gauge 3 (0→S): ler SOMENTE velocidade, rápido
-        if (readPidSafe(VEHICLE_SPEED, v))
-            st->automotiveSystem.canMonitor.vehicleSpeed = (uint16_t)v;
-        return; // não lê RPM aqui
-    }
-
-    // Demais gauges: RPM rápido como antes
-    if (readPidSafe(ENGINE_RPM, v))
-        st->automotiveSystem.canMonitor.engineRPM = (uint16_t)v;
-    // (Velocidade nos gauges 0..2 é tratada em collectSelectedGauge quando o PID selecionado é SPEED)
-}
-
-
-static void collectMedium(SystemStatus *st)
-{
-    float v;
-    if (readPidSafe(FUEL_TANK_LEVEL_INPUT, v))
-        st->automotiveSystem.canMonitor.fuelLevel = (int)v;
-    if (readPidSafe(ENGINE_COOLANT_TEMPERATURE, v))
-        st->automotiveSystem.canMonitor.engineCoolantTemperature = (int)v;
-    if (readPidSafe(AIR_INTAKE_TEMPERATURE, v))
-        st->automotiveSystem.canMonitor.intakeAirTemperature = (int)v;
-    if (readPidSafe(INTAKE_MANIFOLD_ABSOLUTE_PRESSURE, v))
-        st->automotiveSystem.canMonitor.intakeManifoldPressure = (int)v;
-}
-
-static void collectSlow(SystemStatus *st)
-{
-    float v;
-    if (readPidSafe(THROTTLE_POSITION, v))
-        st->automotiveSystem.canMonitor.throttlePosition = (int)v;
-    if (readPidSafe(TIMING_ADVANCE, v))
-        st->automotiveSystem.canMonitor.ignitionTimingAdvance = (int)v;
-    if (readPidSafe(CALCULATED_ENGINE_LOAD, v))
-        st->automotiveSystem.canMonitor.calculatedLoadValue = v;
-    if (readPidSafe(MAF_AIR_FLOW_RATE, v))
-        st->automotiveSystem.canMonitor.massAirFlowRate = v;
-}
-
-static void debugDump(SystemStatus *st)
-{
-    OBD2_TASK_DEBUG_PRINTLN("====== OBD MONITOR ======");
-    OBD2_TASK_DEBUG_PRINTF("Baud: %lu | Ext: %d | Conn: %d\n",
-                          (unsigned long)OBD2.currentBaud(),
-                          OBD2.isExtended() ? 1 : 0,
-                          OBD2.connected() ? 1 : 0);
-
-    OBD2_TASK_DEBUG_PRINTF("RPM: %ld\n", st->automotiveSystem.canMonitor.engineRPM);
-    OBD2_TASK_DEBUG_PRINTF("Velocidade: %d km/h\n", st->automotiveSystem.canMonitor.vehicleSpeed);
-    OBD2_TASK_DEBUG_PRINTF("Combustível: %d\n", st->automotiveSystem.canMonitor.fuelLevel);
-    OBD2_TASK_DEBUG_PRINTF("Temp. Motor: %d °C\n", st->automotiveSystem.canMonitor.engineCoolantTemperature);
-    OBD2_TASK_DEBUG_PRINTF("Temp. Ar: %d °C\n", st->automotiveSystem.canMonitor.intakeAirTemperature);
-    OBD2_TASK_DEBUG_PRINTF("Pressão Coletor: %d kPa\n", st->automotiveSystem.canMonitor.intakeManifoldPressure);
-    OBD2_TASK_DEBUG_PRINTF("Posição Acelerador: %d %%\n", st->automotiveSystem.canMonitor.throttlePosition);
-    OBD2_TASK_DEBUG_PRINTF("Avanço Ignição: %d °\n", st->automotiveSystem.canMonitor.ignitionTimingAdvance);
-    OBD2_TASK_DEBUG_PRINTF("Carga Calculada: %.2f\n", st->automotiveSystem.canMonitor.calculatedLoadValue);
-    OBD2_TASK_DEBUG_PRINTF("MAF: %.2f g/s\n", st->automotiveSystem.canMonitor.massAirFlowRate);
-    OBD2_TASK_DEBUG_PRINTLN("==========================");
-}
-
-/**************************************************************
- * @brief  Lê o PID do gauge atualmente exibido (número central).
- *
- * Regras:
- *  - Gauge 3 (0→S):            COLETA APENAS VELOCIDADE (ritmo ~30 ms).
- *  - Demais gauges (0..2):
- *      - RPM:                  nada a fazer (já vem de collectFast()).
- *      - SPEED:                lê em toda chamada (ritmo ~30 ms).
- *      - Outros PIDs:          respeita períodos internos (mais longos).
- *
- * Observações:
- *  - Esta função pressupõe ser chamada logo após collectFast() no laço ~30 ms.
- *  - readPidSafe() já protege contra barramento/driver desconectado.
- **************************************************************/
-static void collectSelectedGauge(SystemStatus* ss)
-{
-    // Índice do gauge atual: 0,1,2 (gauges normais) e 3 (0→S)
-    const uint8_t idx = ss->nvsAutomotiveConfig.cfgMemory.currGaugeIndex % TOTAL_AUTOMOTIVE_GAUGES;
-
-    // =========================
-    // GAUGE 3: 0→S (tela especial)
-    // - Não acessa slots[3] (evita out-of-bounds, pois slots tem 3 entradas).
-    // - Requisito: ler SOMENTE velocidade, com a mesma cadência do loop rápido.
-    // =========================
-    if (idx == 3) {
-        float v;
-        if (readPidSafe(VEHICLE_SPEED, v)) {
-            ss->automotiveSystem.canMonitor.vehicleSpeed = (uint16_t)v;
-        }
-        return; // nada além de velocidade nesta tela
-    }
-
-    // =========================
-    // GAUGES 0..2: usam a configuração do slot correspondente
-    // =========================
-    const DbAutomotiveGaugePids selPid = ss->nvsAutomotiveConfig.cfgMemory.slots[idx].pid;
-
-    // RPM já é lido por collectFast() (ritmo ~30 ms). Não faça chamada extra aqui.
-    if (selPid == AUTOMOTIVE_GAUGE_PID_RPM) {
-        return;
-    }
-
-    // SPEED (nos gauges 0..2): ler sempre que esta função for chamada (ritmo ~30 ms)
-    if (selPid == AUTOMOTIVE_GAUGE_PID_SPEED) {
-        float v;
-        if (readPidSafe(VEHICLE_SPEED, v)) {
-            ss->automotiveSystem.canMonitor.vehicleSpeed = (uint16_t)v;
-        }
-        return;
-    }
-
-    // =========================
-    // Demais PIDs (períodos moderados/lentos para não sobrecarregar a ECU)
-    // =========================
-
-    // Estes estáticos implementam o rate limit por PID selecionado.
-    static uint32_t lastReadMs = 0;
-    static DbAutomotiveGaugePids lastPid = AUTOMOTIVE_GAUGE_PID_RPM;
-
-    // Período padrão e ajustes por PID (em ms)
-    uint32_t periodMs = 500;   // padrão: 0,5 s
-    if (selPid == AUTOMOTIVE_GAUGE_PID_THROTTLE_POS)      periodMs = 100;   // mais responsivo
-    if (selPid == AUTOMOTIVE_GAUGE_PID_FUEL_TANK_LEVEL)   periodMs = 1000;  // bem lento
-    if (selPid == AUTOMOTIVE_GAUGE_PID_COOLANT_TEMP)      periodMs = 500;
-    if (selPid == AUTOMOTIVE_GAUGE_CONTROL_MODULE_VOLTAGE)periodMs = 500;
-
-    // Se o usuário trocou o PID do slot, forza leitura imediata no novo PID
-    if (selPid != lastPid) {
-        lastPid    = selPid;
-        lastReadMs = 0;
-    }
-
-    const uint32_t now = millis();
-    if ((now - lastReadMs) < periodMs) {
-        return; // ainda não é hora de consultar de novo este PID
-    }
-    lastReadMs = now;
-
-    // Leitura do PID selecionado e gravação no campo correspondente
-    float v = 0.0f;
-    switch (selPid) {
-        case AUTOMOTIVE_GAUGE_PID_COOLANT_TEMP:
-            if (readPidSafe(ENGINE_COOLANT_TEMPERATURE, v)) {
-                ss->automotiveSystem.canMonitor.engineCoolantTemperature = (int)v; // signed int
-            }
-            break;
-
-        case AUTOMOTIVE_GAUGE_PID_THROTTLE_POS:
-            if (readPidSafe(THROTTLE_POSITION, v)) {
-                ss->automotiveSystem.canMonitor.throttlePosition = (uint8_t)v; // 0..100
-            }
-            break;
-
-        case AUTOMOTIVE_GAUGE_CONTROL_MODULE_VOLTAGE:
-            if (readPidSafe(CONTROL_MODULE_VOLTAGE, v)) {
-                ss->automotiveSystem.canMonitor.batteryVoltage = v; // float (ex.: 12.6)
-            }
-            break;
-
-        case AUTOMOTIVE_GAUGE_PID_FUEL_TANK_LEVEL:
-            if (readPidSafe(FUEL_TANK_LEVEL_INPUT, v)) {
-                ss->automotiveSystem.canMonitor.fuelLevel = (uint8_t)v; // 0..100
-            }
-            break;
-
-        default:
-            // Outros PIDs não mapeados aqui
-            break;
-    }
-}
-
-
-
-
-// // ---------- Task principal ----------
-// void obd2Task_run(void *pvParameters)
-// {
-//     SystemStatus *systemStatus = (SystemStatus *)pvParameters;
-
-//     uint32_t lastBg = 0;
-
-//     systemStatus->automotiveSystem.zeroToS.state     = ZTS_IDLE;
-//     systemStatus->automotiveSystem.zeroToS.targetKmh =
-//         systemStatus->nvsAutomotiveConfig.cfgMemory.zeroToS_target_kmh;
-
-//     OBD2_TASK_DEBUG_PRINTLN("------------------------");
-//     OBD2_TASK_DEBUG_PRINTLN("    CAN OBD2 MONITOR TASK");
-//     OBD2_TASK_DEBUG_PRINTLN("------------------------");
-
-
-//     vTaskDelay(pdMS_TO_TICKS(TIME_TO_INIT_TASK_CAN));
-
-//     // Pinos do TWAI
-//     CAN0.setCANPins((gpio_num_t)PIN_PCI_ATHENAS_CAN_RX,
-//                     (gpio_num_t)PIN_PCI_ATHENAS_CAN_TX);
-
-//     // FSM OBD2
-//     OBD2.setTimeout(TIME_TO_REQUEST_CAN_PID);
-//     OBD2.setHeartbeatPid(ENGINE_RPM);
-//     OBD2.setHeartbeatInterval(1000);
-//     OBD2.setBackoff(1000, 8000);
-//     OBD2.setReconnectInterval(20000);
-
-//     OBD2.beginAuto(); // primeira tentativa
-
-//     systemStatus->automotiveSystem.canConnected = OBD2.connected();
-//     systemStatus->automotiveSystem.canBaud     = OBD2.currentBaud();
-//     systemStatus->automotiveSystem.canExtended = OBD2.isExtended() ? 1 : 0;
-//     resetValuePIDs(systemStatus);
-
-//     unsigned long canTimer = millis();
-
-//     for (;;)
-//     {
-//         task_checkUsedMem(TASK_NAME_OBD2, &canTimer);
-
-//         const bool onAutoPages =
-//             systemStatus->display.currPage == DISPLAY_PAGE_AUTOMOTIVE_GAUGES ||
-//             systemStatus->display.currPage == DISPLAY_PAGE_NIKO;
-
-//         // Mantém FSM viva sempre (mas só ler PID quando conectado)
-//         OBD2.tick();
-
-//         // Reflete status atual para o app
-//         systemStatus->automotiveSystem.canConnected = OBD2.connected();
-//         systemStatus->automotiveSystem.canBaud     = OBD2.currentBaud();
-//         systemStatus->automotiveSystem.canExtended = OBD2.isExtended() ? 1 : 0;
-
-//         if (!onAutoPages) {
-//             // <<< MODO BACKGROUND: NÃO HÁ LEITURA DE PID AQUI >>>
-//             // Antes havia collectFast() de 1 em 1s — isso causava leitura com driver fora do ar.
-//             // Mantemos só o heartbeat/tick e uma coleta ocasional *apenas se* conectado.
-//             if (OBD2.connected() && (millis() - lastBg > 1000)) {
-//                 lastBg = millis();
-//                 collectFast(systemStatus);  // ok porque está conectado (guard acima)
-//             }
-//             vTaskDelay(pdMS_TO_TICKS(100)); // mais responsivo que 200ms
-//             continue;
-//         }
-
-//         if (systemStatus->automotiveSystem.canConnected)
-//         {
-//             uint32_t now = millis();
-
-//             if (now - lastFast >= 30) {
-//                 lastFast = now;
-//                 collectFast(systemStatus);
-//                 collectSelectedGauge(systemStatus);       // valor central do gauge atual
-//             }
-//             if (now - lastMed >= 600) {
-//                 lastMed = now;
-//                 // collectMedium(systemStatus);
-//             }
-//             if (now - lastSlow >= 1000) {
-//                 lastSlow = now;
-//                 // collectSlow(systemStatus);
-//             }
-//             if (now - lastLog >= 1000) {
-//                 lastLog = now;
-//                 debugDump(systemStatus);
-//             }
-//         }
-//         else
-//         {
-//             // Não conectado: zera PIDs e loga tempo p/ próxima tentativa
-//             resetValuePIDs(systemStatus);
-
-//             static uint32_t lastDebugReconnect = 0;
-//             uint32_t now = millis();
-
-//             if (now - lastDebugReconnect >= 1000) {
-//                 lastDebugReconnect = now;
-//                 systemStatus->automotiveSystem.nextConnectionTimeout = OBD2.timeToNextReconnect();
-//                 OBD2_TASK_DEBUG_PRINTF("Sem conexão. Próxima tentativa em %lu ms\n",
-//                     (unsigned long)systemStatus->automotiveSystem.nextConnectionTimeout);
-//             }
-//         }
-
-//         vTaskDelay(pdMS_TO_TICKS(10));
-//     }
-// } 
-
-
 // =============================================================
-// === CONFIGURAÇÕES DO HARDWARE (ajuste conforme sua placa) ===
-// =============================================================
-#define KLINE_RX_PIN PIN_PCI_ATHENAS_CAN_RX  // ESP32 RX ← L9637D TX
-#define KLINE_TX_PIN PIN_PCI_ATHENAS_CAN_TX  // ESP32 TX → L9637D RX
-#define KLINE_BAUDRATE 10400                 // ISO9141/KWP2000 FAST
-
-// =============================================================
-// === INSTÂNCIA DO DRIVER K-LINE ===============================
-// =============================================================
-static OBD2_KLine KLine(Serial1, KLINE_BAUDRATE, KLINE_RX_PIN, KLINE_TX_PIN);
-
-// =============================================================
-// === TASK PRINCIPAL PARA TESTE DO K-LINE COM L9637D ============
+// ===================== TASK PRINCIPAL ========================
 // =============================================================
 void obd2Task_run(void *pvParameters)
 {
     SystemStatus *systemStatus = (SystemStatus *)pvParameters;
 
-    OBD2_TASK_DEBUG_PRINTLN("\n==============================");
-    OBD2_TASK_DEBUG_PRINTLN("     K-LINE TEST TASK (L9637D)");
-    OBD2_TASK_DEBUG_PRINTLN("==============================\n");
+    uint32_t lastSwitchAttempt = 0;
+    uint32_t lastRequest = 0;
+    uint32_t lastLog = 0;
+    bool connected = false;
 
-    vTaskDelay(pdMS_TO_TICKS(2000));  // Aguarda o sistema estabilizar
+    OBD2_TASK_DEBUG_PRINTLN("\n=======================================");
+    OBD2_TASK_DEBUG_PRINTLN("   OBD2 AUTO-SYNC TASK (CAN <-> KLINE)");
+    OBD2_TASK_DEBUG_PRINTLN("=======================================\n");
 
-    // === Configurações de protocolo e debug ===
+    vTaskDelay(pdMS_TO_TICKS(2000));  // Aguarda inicialização completa
+
+    // ----------------------------------------------------------
+    // Configuração inicial do driver CAN
+    // ----------------------------------------------------------
+    CAN0.setCANPins((gpio_num_t)PIN_PCI_ATHENAS_CAN_RX, (gpio_num_t)PIN_PCI_ATHENAS_CAN_TX);
+    OBD2.setTimeout(TIME_TO_REQUEST_CAN_PID);
+    OBD2.setHeartbeatPid(ENGINE_RPM);
+    OBD2.setHeartbeatInterval(1000);
+    OBD2.setBackoff(1000, 8000);
+    OBD2.setReconnectInterval(20000);
+
+    // ----------------------------------------------------------
+    // Configuração inicial do driver K-Line
+    // ----------------------------------------------------------
     KLine.setDebug(Serial);
-    KLine.setProtocol("Automatic");   // Tenta ISO9141 e ISO14230
+    KLine.setProtocol("Automatic");
     KLine.setByteWriteInterval(5);
     KLine.setInterByteTimeout(60);
     KLine.setReadTimeout(1000);
-    KLine.setSerial(true);            // Inicializa UART e mantém TX em idle HIGH
 
-    unsigned long lastRequest = millis();
-    unsigned long lastLog = millis();
-    unsigned long taskTimer = millis();
+    resetValuePIDs(systemStatus);
 
-    bool connected = false;
-    uint32_t lastReconnectAttempt = 0;
-
+    // ==========================================================
+    // LOOP PRINCIPAL (FSM - Máquina de Estados)
+    // ==========================================================
     for (;;)
     {
-        task_checkUsedMem(TASK_NAME_OBD2, &taskTimer);
-
-        // ============================================================
-        // === Tenta conexão automática se ainda não estiver conectada
-        // ============================================================
-        if (!connected)
+        switch (obdMode)
         {
-            // Aguarda 5 segundos entre tentativas
-            if (millis() - lastReconnectAttempt < 5000)
-            {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                continue;
-            }
+            // ==========================================================
+            // 1️⃣ Tentativa de inicializar CAN
+            // ==========================================================
+            case OBD_MODE_TRY_CAN:
+                OBD2_TASK_DEBUG_PRINTLN("[FSM] Tentando comunicação via CAN...");
 
-            OBD2_TASK_DEBUG_PRINTLN("🔄 Tentando estabelecer comunicação com ECU...");
-            lastReconnectAttempt = millis();
-            connected = KLine.initOBD2();
-
-            if (connected)
-            {
-                OBD2_TASK_DEBUG_PRINTLN("✅ Comunicação K-Line estabelecida!");
-                systemStatus->automotiveSystem.canConnected = true;
-            }
-            else
-            {
-                OBD2_TASK_DEBUG_PRINTLN("❌ Falha ao inicializar K-Line. Tentando novamente em 5s...");
-                systemStatus->automotiveSystem.canConnected = false;
-
-                KLine.powerDownBus();  // desliga UART e libera pinos
-                vTaskDelay(pdMS_TO_TICKS(5000));
-                continue;
-            }
-        }
-
-        // ============================================================
-        // === Comunicação ativa: leitura de dados a cada 2 segundos ===
-        // ============================================================
-        if (millis() - lastRequest >= 2000)
-        {
-            lastRequest = millis();
-
-            // === Leitura de RPM (PID 0x0C) ===
-            OBD2_TASK_DEBUG_PRINTLN("🔁 Solicitando PID 0x0C (Engine RPM)...");
-            float rpm = KLine.getPID(read_LiveData, 0x0C);
-
-            if (rpm > 0)
-            {
-                systemStatus->automotiveSystem.canMonitor.engineRPM = rpm;
-                OBD2_TASK_DEBUG_PRINTF("🔥 RPM: %.0f rpm\n", rpm);
-            }
-            else
-            {
-                OBD2_TASK_DEBUG_PRINTLN("❌ Falha ao ler PID 0x0C. Tentando reconectar...");
-                connected = false;  // força nova tentativa
+                // Desliga K-Line e comuta MUX para modo CAN
                 KLine.powerDownBus();
-                vTaskDelay(pdMS_TO_TICKS(5000));
-                continue;
-            }
+                setMuxState(systemStatus, false);      // Força MUX em modo CAN
+                OBD2_TASK_DEBUG_PRINTLN("[MUX] 🕒 Aguardando estabilização (500 ms)...");
+                vTaskDelay(pdMS_TO_TICKS(500));        // Aguarda troca física
+
+                // Inicializa o driver CAN após a comutação
+                OBD2.beginAuto();
+                vTaskDelay(pdMS_TO_TICKS(300));        // Aguarda driver estabilizar
+
+                if (OBD2.connected())
+                {
+                    OBD2_TASK_DEBUG_PRINTLN("✅ Comunicação CAN estabelecida!");
+                    obdMode = OBD_MODE_CAN_ACTIVE;
+                    connected = true;
+                    break;
+                }
+
+                OBD2_TASK_DEBUG_PRINTLN("❌ Falha no CAN. Tentando K-Line...");
+                OBD2.end();  // encerra driver CAN antes de trocar
+                connected = false;
+                obdMode = OBD_MODE_TRY_KLINE;
+                lastSwitchAttempt = millis();
+                break;
+
+            // ==========================================================
+            // 2️⃣ Comunicação CAN ativa
+            // ==========================================================
+            case OBD_MODE_CAN_ACTIVE:
+                OBD2.tick();
+
+                if (!OBD2.connected())
+                {
+                    OBD2_TASK_DEBUG_PRINTLN("⚠️ CAN desconectado. Alternando para K-Line...");
+                    OBD2.end();
+                    connected = false;
+                    obdMode = OBD_MODE_TRY_KLINE;
+                    lastSwitchAttempt = millis();
+                    break;
+                }
+
+                // Leitura periódica de RPM via CAN
+                if (millis() - lastRequest >= 500)
+                {
+                    lastRequest = millis();
+                    float rpm = 0.0f;
+                    if (OBD2.readPid(ENGINE_RPM, rpm))
+                    {
+                        systemStatus->automotiveSystem.canMonitor.engineRPM = rpm;
+                        OBD2_TASK_DEBUG_PRINTF("🔥 [CAN] RPM: %.0f\n", rpm);
+                    }
+                }
+                break;
+
+            // ==========================================================
+            // 3️⃣ Tentativa de inicializar K-Line
+            // ==========================================================
+            case OBD_MODE_TRY_KLINE:
+                if (millis() - lastSwitchAttempt < KLINE_RETRY_INTERVAL_MS)
+                    break;  // evita flood de tentativas
+
+                OBD2_TASK_DEBUG_PRINTLN("[FSM] Tentando comunicação via K-Line...");
+
+                // Desliga CAN e comuta MUX para modo K-Line
+                OBD2.end();
+                setMuxState(systemStatus, true);        // Força MUX em modo K-Line
+                OBD2_TASK_DEBUG_PRINTLN("[MUX] 🕒 Aguardando estabilização (500 ms)...");
+                vTaskDelay(pdMS_TO_TICKS(500));         // Aguarda troca física
+
+                // Inicializa driver UART/K-Line após estabilização
+                KLine.setSerial(true);
+                connected = KLine.initOBD2();
+
+                if (connected)
+                {
+                    OBD2_TASK_DEBUG_PRINTLN("✅ Comunicação K-Line estabelecida!");
+                    obdMode = OBD_MODE_KLINE_ACTIVE;
+                    break;
+                }
+
+                OBD2_TASK_DEBUG_PRINTLN("❌ Falha na K-Line. Voltando ao CAN...");
+                KLine.powerDownBus();
+                obdMode = OBD_MODE_TRY_CAN;
+                lastSwitchAttempt = millis();
+                break;
+
+            // ==========================================================
+            // 4️⃣ Comunicação K-Line ativa
+            // ==========================================================
+            case OBD_MODE_KLINE_ACTIVE:
+                if (!connected)
+                {
+                    obdMode = OBD_MODE_TRY_CAN;
+                    break;
+                }
+
+                // Leitura de RPM a cada 2 segundos
+                if (millis() - lastRequest >= 2000)
+                {
+                    lastRequest = millis();
+
+                    float rpm = KLine.getPID(read_LiveData, 0x0C);
+                    if (rpm > 0)
+                    {
+                        systemStatus->automotiveSystem.canMonitor.engineRPM = rpm;
+                        OBD2_TASK_DEBUG_PRINTF("🔥 [KLINE] RPM: %.0f\n", rpm);
+                    }
+                    else
+                    {
+                        OBD2_TASK_DEBUG_PRINTLN("❌ Falha ao ler PID. Voltando ao modo CAN...");
+                        KLine.powerDownBus();
+                        connected = false;
+                        obdMode = OBD_MODE_TRY_CAN;
+                        lastSwitchAttempt = millis();
+                    }
+                }
+                break;
         }
 
-        // ============================================================
-        // === Log periódico de status
-        // ============================================================
+        // ==========================================================
+        // Log de status periódico (3 s)
+        // ==========================================================
         if (millis() - lastLog >= 3000)
         {
             lastLog = millis();
-            OBD2_TASK_DEBUG_PRINTF("[KLINE] Conectado: %d | Baud: %lu | RPM: %.0f\n",
-                                   connected,
-                                   (unsigned long)KLINE_BAUDRATE,
+            OBD2_TASK_DEBUG_PRINTF("[STATUS] Modo: %d | CAN: %d | KLine: %d | RPM: %.0f\n",
+                                   obdMode,
+                                   (OBD2.connected() ? 1 : 0),
+                                   (connected ? 1 : 0),
                                    systemStatus->automotiveSystem.canMonitor.engineRPM);
         }
 
